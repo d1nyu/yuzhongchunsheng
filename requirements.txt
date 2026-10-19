@@ -1,0 +1,8 @@
+PyQt5==5.15.10
+requests>=2.31
+pywin32>=305
+rapidocr_onnxruntime>=1.4.4
+numpy>=2.0,<2.1
+soundcard==0.4.6
+vosk>=0.3.45
+

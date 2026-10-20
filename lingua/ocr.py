@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, Qt, pyqtSignal
 from PyQt5.QtGui import QImage
 
 
@@ -70,7 +70,7 @@ def combine_ocr_lines(result: Any) -> str:
             confidence = float(score)
         except (TypeError, ValueError):
             continue
-        if confidence < 0.32 or not isinstance(text, str) or not text.strip():
+        if confidence < 0.24 or not isinstance(text, str) or not text.strip():
             continue
         try:
             xs = [float(point[0]) for point in box]
@@ -120,6 +120,23 @@ class SubtitleOcrWorker(QThread):
         self._stopping = False
 
     def submit(self, image: QImage) -> None:
+        if not image.isNull() and (image.width() < 320 or image.height() < 80):
+            factor = min(
+                6.0,
+                max(
+                    2.0,
+                    min(
+                        320.0 / max(1, image.width()),
+                        80.0 / max(1, image.height()),
+                    ),
+                ),
+            )
+            image = image.scaled(
+                max(1, int(image.width() * factor)),
+                max(1, int(image.height() * factor)),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
         array = qimage_to_numpy(image)
         if array is None or self._stopping:
             return

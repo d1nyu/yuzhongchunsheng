@@ -40,7 +40,7 @@ from .languages import (
     speech_culture_for_source,
 )
 from .ocr import SubtitleOcrWorker
-from .overlay import RegionSelector, SubtitleOverlay
+from .overlay import QuickTranslationPopup, RegionSelector, SubtitleOverlay
 from .secrets import reveal_secret
 from .settings_dialog import SettingsDialog
 from .speech import (
@@ -133,6 +133,10 @@ class MainWindow(QMainWindow):
         self._text_ocr_worker: SubtitleOcrWorker | None = None
         self._text_ocr_pending = False
         self._text_region_selector: RegionSelector | None = None
+        self._quick_popup: QuickTranslationPopup | None = None
+        self._quick_region: QRect | None = None
+        self._quick_source_text = ""
+        self._quick_seq = 0
         self._hotkey_filter: GlobalHotkeyFilter | None = None
 
         self.setWindowTitle("羽中纯声 · 文字 / 语音 / 视频翻译")
@@ -971,7 +975,13 @@ class MainWindow(QMainWindow):
             self._stop_video_monitoring()
         if self._speech_worker is not None and self._speech_worker.isRunning():
             self._stop_listening()
-        selector = RegionSelector("拖动框选屏幕上的文字  ·  按 Esc 取消")
+        if self._quick_popup is not None:
+            self._quick_popup.hide()
+        selector = RegionSelector(
+            "拖动框选屏幕上的文字  ·  按 Esc 取消",
+            min_width=12,
+            min_height=8,
+        )
         self._text_region_selector = selector
         selector.region_selected.connect(self._text_region_selected)
         selector.cancelled.connect(self._text_region_cancelled)
@@ -990,8 +1000,23 @@ class MainWindow(QMainWindow):
     def _capture_text_region(self, region: QRect) -> None:
         pixmap = self._capture_region_pixmap(region)
         if pixmap is None or pixmap.isNull():
-            self.toast.show_message("无法截取该区域，请重新框选。", "error")
+            self._text_ocr_pending = False
+            self._show_quick_popup(region)
+            if self._quick_popup is not None:
+                self._quick_popup.set_content(
+                    "",
+                    "无法识别",
+                    "无法截取该区域，请重新框选。",
+                )
             return
+        self._quick_region = region
+        self._show_quick_popup(region)
+        if self._quick_popup is not None:
+            self._quick_popup.set_content(
+                "",
+                "正在识别…",
+                "正在识别选区文字…",
+            )
         worker = self._text_ocr_worker
         if worker is None:
             worker = SubtitleOcrWorker(self)
@@ -1003,7 +1028,6 @@ class MainWindow(QMainWindow):
             worker.start()
         self._text_ocr_pending = True
         worker.submit(pixmap.toImage())
-        self.toast.show_message("正在识别选区文字…", "info", 2200)
 
     def _text_ocr_ready(self, text: str) -> None:
         if not self._text_ocr_pending:
@@ -1011,27 +1035,44 @@ class MainWindow(QMainWindow):
         self._text_ocr_pending = False
         text = text.strip()
         if not text:
-            self.toast.show_message("选区内没有识别到文字。", "error")
+            if self._quick_popup is not None:
+                self._quick_popup.set_error(
+                    "选区内没有识别到文字，请调整选区后重试。"
+                )
             return
-        if self._mode != 0:
-            self.mode_control.setCurrentIndex(0)
-            self._mode_changed(0)
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
-        self.source_edit.setPlainText(text)
-        self.source_edit.setFocus()
-        self._set_text_status("success", "已识别选区文字 · 正在翻译")
+        self._quick_source_text = text
+        if self._quick_popup is None:
+            if self._quick_region is not None:
+                self._show_quick_popup(self._quick_region)
+        if self._quick_popup is not None:
+            self._quick_popup.set_content(
+                text,
+                "正在翻译…",
+                "正在翻译选区文字…",
+            )
         QTimer.singleShot(
-            120,
-            lambda: self._start_translation("text", user_initiated=False),
+            80,
+            lambda: self._start_translation("quick", user_initiated=False),
         )
 
     def _text_ocr_error(self, message: str) -> None:
         if not self._text_ocr_pending:
             return
         self._text_ocr_pending = False
-        self.toast.show_message(message, "error", 4200)
+        if self._quick_popup is not None:
+            self._quick_popup.set_error(message)
+        else:
+            self.toast.show_message(message, "error", 4200)
+
+    def _show_quick_popup(self, region: QRect) -> None:
+        if self._quick_popup is None:
+            self._quick_popup = QuickTranslationPopup()
+            self._quick_popup.speak_requested.connect(self._speak_quick_text)
+        self._quick_popup.show_for_region(region)
+
+    def _speak_quick_text(self, text: str) -> None:
+        if text.strip():
+            self.speaker.speak(text.strip(), self._target_code())
 
     def _video_region_selected(self, region: QRect) -> None:
         self._region_selector = None
@@ -1376,6 +1417,9 @@ class MainWindow(QMainWindow):
         if context == "text":
             text = self.source_edit.toPlainText().strip()
             source = self._source_code()
+        elif context == "quick":
+            text = self._quick_source_text.strip()
+            source = self._source_code()
         elif context == "voice":
             text = self.voice_source_edit.toPlainText().strip()
             source = self._speech_source_culture or self._source_code()
@@ -1412,15 +1456,22 @@ class MainWindow(QMainWindow):
                 self._set_text_status("error", "请先配置翻译引擎")
             elif context == "voice":
                 self._set_voice_status("error", "请先配置翻译引擎")
+            elif context == "quick":
+                if self._quick_popup is not None:
+                    self._quick_popup.set_error(message)
             else:
                 self._set_video_status("error", "请先配置翻译引擎")
             if user_initiated:
                 QTimer.singleShot(250, self._open_settings)
             return
 
-        self._request_seq += 1
-        request_id = self._request_seq
-        self._translating = True
+        if context == "quick":
+            self._quick_seq += 1
+            request_id = self._quick_seq
+        else:
+            self._request_seq += 1
+            request_id = self._request_seq
+            self._translating = True
         target = self._target_code()
         engine_label = ENGINE_LABELS.get(engine, engine)
         if context == "text":
@@ -1431,6 +1482,13 @@ class MainWindow(QMainWindow):
             self.voice_translate_button.setEnabled(False)
             self.voice_translate_button.setText("翻译中…")
             self._set_voice_status("busy", f"正在使用 {engine_label} 翻译…")
+        elif context == "quick":
+            if self._quick_popup is not None:
+                self._quick_popup.set_content(
+                    self._quick_source_text,
+                    "正在翻译…",
+                    f"正在使用 {engine_label} 翻译…",
+                )
         else:
             self.video_translate_button.setEnabled(False)
             self.video_translate_button.setText("翻译中…")
@@ -1454,9 +1512,14 @@ class MainWindow(QMainWindow):
     def _translation_succeeded(
         self, request_id: int, context: str, result: TranslationResult
     ) -> None:
-        if request_id != self._request_seq:
-            return
-        self._translating = False
+        if context == "quick":
+            if request_id != self._quick_seq:
+                return
+        else:
+            if request_id != self._request_seq:
+                return
+            self._translating = False
+        target_text = ""
         if context == "text":
             self.text_result_edit.setPlainText(result.text)
             self.text_provider_badge.setText(result.provider)
@@ -1470,6 +1533,15 @@ class MainWindow(QMainWindow):
             self._set_text_status("success", f"翻译完成 · {result.provider}")
             self._last_text_translated = self.source_edit.toPlainText().strip()
             target_text = self.text_result_edit.toPlainText()
+        elif context == "quick":
+            if self._quick_popup is not None:
+                self._quick_popup.set_content(
+                    self._quick_source_text,
+                    result.text,
+                    f"翻译完成 · {result.provider}",
+                    result.provider,
+                )
+            target_text = result.text
         elif context == "voice":
             self.voice_result_edit.setPlainText(result.text)
             self.voice_provider_badge.setText(result.provider)
@@ -1513,6 +1585,15 @@ class MainWindow(QMainWindow):
                 self.speaker.speak(target_text, self._target_code())
 
     def _translation_failed(self, request_id: int, context: str, message: str) -> None:
+        if context == "quick":
+            if request_id != self._quick_seq:
+                return
+            if self._quick_popup is not None:
+                self._quick_popup.set_error(message)
+            self.toast.show_message(message, "error", 5200)
+            if "API Key" in message and not self._settings_open:
+                QTimer.singleShot(300, self._open_settings)
+            return
         if request_id != self._request_seq:
             return
         self._translating = False
@@ -1832,6 +1913,10 @@ class MainWindow(QMainWindow):
             self._text_ocr_worker.wait(2500)
             self._text_ocr_worker.deleteLater()
             self._text_ocr_worker = None
+        if self._quick_popup is not None:
+            self._quick_popup.close()
+            self._quick_popup.deleteLater()
+            self._quick_popup = None
         if self._video_monitoring:
             self._stop_video_monitoring()
         if self._speech_worker is not None and self._speech_worker.isRunning():

@@ -3,22 +3,147 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+import os
 import queue
 import re
 import threading
+from collections import deque
+from pathlib import Path
 from difflib import SequenceMatcher
 
 import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .config import data_models_dir
+from .languages import whisper_language
 
 
 SAMPLE_RATE = 16000
+WHISPER_MODEL_NAME = "ggml-base-q5_1.bin"
+ASR_FRAME_MS = 20
+ASR_FRAME_SAMPLES = SAMPLE_RATE * ASR_FRAME_MS // 1000
 
 
 def normalize_transcript(text: str) -> str:
     return re.sub(r"[\W_]+", "", text.lower())
+
+
+def whisper_model_path() -> Path:
+    return data_models_dir() / "whisper" / WHISPER_MODEL_NAME
+
+
+def whisper_is_available() -> bool:
+    path = whisper_model_path()
+    return (
+        importlib.util.find_spec("pywhispercpp") is not None
+        and path.exists()
+        and path.stat().st_size > 55 * 1024 * 1024
+    )
+
+
+class PauseSegmenter:
+    """Split streamed audio at natural pauses instead of fixed-time chunks."""
+
+    def __init__(
+        self,
+        min_speech_ms: int = 320,
+        end_silence_ms: int = 600,
+        max_segment_ms: int = 10000,
+        pre_roll_ms: int = 260,
+        trailing_ms: int = 300,
+    ):
+        self.min_speech_frames = max(1, min_speech_ms // ASR_FRAME_MS)
+        self.end_silence_frames = max(1, end_silence_ms // ASR_FRAME_MS)
+        self.max_frames = max(1, max_segment_ms // ASR_FRAME_MS)
+        self.trailing_frames = max(0, trailing_ms // ASR_FRAME_MS)
+        self._pre_roll: deque[np.ndarray] = deque(
+            maxlen=max(1, pre_roll_ms // ASR_FRAME_MS)
+        )
+        self._frames: list[np.ndarray] = []
+        self._pending = np.empty(0, dtype=np.float32)
+        self._in_speech = False
+        self._speech_frames = 0
+        self._last_speech_index = -1
+        self._silence_frames = 0
+        try:
+            import webrtcvad
+
+            self._vad = webrtcvad.Vad(2)
+        except Exception:
+            self._vad = None
+
+    def add_block(self, samples: np.ndarray) -> np.ndarray | None:
+        if samples.size == 0:
+            return None
+        self._pending = np.concatenate(
+            (self._pending, np.asarray(samples, dtype=np.float32).reshape(-1))
+        )
+        completed: np.ndarray | None = None
+        while self._pending.size >= ASR_FRAME_SAMPLES:
+            frame = self._pending[:ASR_FRAME_SAMPLES].copy()
+            self._pending = self._pending[ASR_FRAME_SAMPLES:]
+            completed = self._add_frame(frame)
+            if completed is not None:
+                return completed
+        return None
+
+    def flush(self) -> np.ndarray | None:
+        if not self._in_speech:
+            self._reset()
+            return None
+        return self._finish_segment()
+
+    def _add_frame(self, frame: np.ndarray) -> np.ndarray | None:
+        pcm = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        rms = float(np.sqrt(np.mean(np.square(frame)))) if frame.size else 0.0
+        vad_active = False
+        if self._vad is not None:
+            try:
+                vad_active = self._vad.is_speech(pcm, SAMPLE_RATE)
+            except Exception:
+                vad_active = False
+        active = vad_active and rms > 0.00045
+
+        if active:
+            if not self._in_speech:
+                self._in_speech = True
+                self._frames = list(self._pre_roll)
+                self._pre_roll.clear()
+            self._frames.append(frame)
+            self._speech_frames += 1
+            self._last_speech_index = len(self._frames) - 1
+            self._silence_frames = 0
+        elif self._in_speech:
+            self._frames.append(frame)
+            self._silence_frames += 1
+            if self._silence_frames >= self.end_silence_frames:
+                return self._finish_segment()
+        else:
+            self._pre_roll.append(frame)
+
+        if self._in_speech and len(self._frames) >= self.max_frames:
+            return self._finish_segment()
+        return None
+
+    def _finish_segment(self) -> np.ndarray | None:
+        if self._speech_frames < self.min_speech_frames or not self._frames:
+            self._reset()
+            return None
+        end = min(
+            len(self._frames),
+            self._last_speech_index + 1 + self.trailing_frames,
+        )
+        audio = np.concatenate(self._frames[:end]).astype(np.float32)
+        self._reset()
+        return audio
+
+    def _reset(self) -> None:
+        self._frames = []
+        self._in_speech = False
+        self._speech_frames = 0
+        self._last_speech_index = -1
+        self._silence_frames = 0
 
 
 class SystemAudioTranscriber(QObject):
@@ -51,7 +176,7 @@ class SystemAudioTranscriber(QObject):
         )
         self._infer_thread = threading.Thread(
             target=self._transcribe_loop,
-            name="YuzhongChunshengVosk",
+            name="YuzhongChunshengWhisper",
             daemon=True,
         )
         self._capture_thread.start()
@@ -120,6 +245,22 @@ class SystemAudioTranscriber(QObject):
                 pass
 
     def _transcribe_loop(self) -> None:
+        if whisper_is_available():
+            try:
+                self._whisper_loop()
+                return
+            except Exception as exc:
+                if self.language not in {"auto", "en"}:
+                    if not self._stop_event.is_set():
+                        self.error.emit(f"多语言语音识别失败：{exc}")
+                    self._stop_event.set()
+                    return
+                self.status_changed.emit(
+                    f"Whisper 不可用（{exc}），回退到 Vosk 英语模型…"
+                )
+        self._vosk_loop()
+
+    def _vosk_loop(self) -> None:
         recognizer = None
         try:
             import vosk
@@ -169,7 +310,111 @@ class SystemAudioTranscriber(QObject):
                 except Exception:
                     pass
 
-    def _emit_text(self, text: str) -> None:
+    def _whisper_loop(self) -> None:
+        from pywhispercpp.model import Model
+
+        model_path = whisper_model_path()
+        if not model_path.exists():
+            raise RuntimeError(
+                "Whisper 多语言模型尚未安装。请运行 "
+                "python scripts/install_whisper_model.py"
+            )
+        self.status_changed.emit("正在加载 Whisper 多语言模型…")
+        n_threads = max(4, (os.cpu_count() or 4) - 2)
+        model = Model(
+            str(model_path),
+            n_threads=n_threads,
+            print_progress=False,
+            print_realtime=False,
+            print_timestamps=False,
+            suppress_non_speech_tokens=True,
+            redirect_whispercpp_logs_to=False,
+        )
+        self.device_label = "Whisper 多语言"
+        if not self._stop_event.is_set():
+            self.status_changed.emit(
+                "Whisper 多语言已就绪 · 正在聆听电脑播放的声音…"
+            )
+        language = whisper_language(self.language)
+        auto_detect = not language
+        detected_language = language
+        if language:
+            available_languages = set(Model.available_languages())
+            if language not in available_languages:
+                self.status_changed.emit(
+                    "所选源语言不在 Whisper 模型支持范围内，改为自动识别…"
+                )
+                language = ""
+                detected_language = ""
+                auto_detect = True
+        segmenter = PauseSegmenter()
+        while not self._stop_event.is_set():
+            try:
+                item = self._audio_queue.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            if item.size == 0:
+                continue
+            chunk = segmenter.add_block(item)
+            if chunk is not None:
+                detected_language = self._transcribe_whisper_segment(
+                    model,
+                    chunk,
+                    auto_detect,
+                    detected_language,
+                )
+        final_chunk = segmenter.flush()
+        if final_chunk is not None and not self._stop_event.is_set():
+            self._transcribe_whisper_segment(
+                model,
+                final_chunk,
+                auto_detect,
+                detected_language,
+            )
+
+    def _transcribe_whisper_segment(
+        self,
+        model,
+        chunk: np.ndarray,
+        auto_detect: bool,
+        detected_language: str,
+    ) -> str:
+        rms = float(np.sqrt(np.mean(np.square(chunk))))
+        if rms < 0.00035:
+            return detected_language
+        peak = float(np.max(np.abs(chunk)))
+        chunk = np.clip(chunk / max(peak, 0.04) * 0.78, -1.0, 1.0)
+        if auto_detect and not detected_language:
+            detection = model.auto_detect_language(chunk.astype(np.float32))
+            detected_language = detection[0][0]
+            if not detected_language:
+                return ""
+        segments = model.transcribe(
+            chunk.astype(np.float32),
+            language=detected_language,
+            detect_language=False,
+            no_timestamps=False,
+            print_progress=False,
+            print_realtime=False,
+            print_timestamps=False,
+            suppress_blank=True,
+            suppress_non_speech_tokens=True,
+            no_speech_thold=0.62,
+            logprob_thold=-1.1,
+            temperature=0.0,
+            greedy={"best_of": 1},
+        )
+        text = " ".join(
+            segment.text.strip()
+            for segment in segments
+            if segment.text and segment.text.strip()
+        )
+        self._emit_text(text, detected_language)
+        return detected_language
+
+    def _emit_text(self, text: str, language_code: str | None = None) -> None:
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return
@@ -193,5 +438,5 @@ class SystemAudioTranscriber(QObject):
         ):
             return
         self._last_transcript_key = key
-        self.transcript_ready.emit(text, self.language)
+        self.transcript_ready.emit(text, language_code or self.language)
 

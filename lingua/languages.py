@@ -237,5 +237,17 @@ def app_language_from_asr(code: str) -> str:
     return "auto"
 
 
+def whisper_language(code: str) -> str:
+    if not code or code == "auto":
+        return ""
+    overrides = {
+        "zh-CN": "zh",
+        "zh-TW": "zh",
+        "mni-Mtei": "",
+        "ckb": "",
+    }
+    return overrides.get(code, code.split("-")[0])
+
+
 SOURCE_LANGUAGES = LANGUAGES
 TARGET_LANGUAGES = tuple(item for item in LANGUAGES if item.code != "auto")

@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
 )
 
 from . import theme
-from .audio_translate import SystemAudioTranscriber
+from .audio_translate import SystemAudioTranscriber, whisper_is_available
 from .config import ENGINE_LABELS, load_settings, save_settings
 from .hotkeys import GlobalHotkeyFilter
 from .languages import (
@@ -908,7 +908,7 @@ class MainWindow(QMainWindow):
         if mode == "audio":
             self.video_headline.setText("用电脑声音实时翻译视频")
             self.video_hint.setText(
-                "无需字幕。程序采集电脑正在播放的声音，在本机用 Vosk 转写，再交给 DeepSeek 翻译。"
+                "无需字幕。Whisper 自动识别语言，并按说话停顿断句后交给 DeepSeek 翻译。"
             )
             self.video_region_label.setText(
                 "声音来源：默认扬声器回环 · 不占用麦克风"
@@ -917,12 +917,13 @@ class MainWindow(QMainWindow):
             self.video_start_button.setEnabled(True)
             self.video_preview.setPixmap(QPixmap())
             self.video_preview.setText(
-                "电脑声音\n\nVosk 本地转写\nDeepSeek 翻译"
+                "电脑声音\n\nWhisper 多语言转写\nDeepSeek 翻译"
             )
-            self.video_engine_pill.setText("Vosk · 本地 · 英语")
-            self.video_source_badge.setText("Vosk 语音")
+            engine = "Whisper · 本地 · 多语言" if whisper_is_available() else "Vosk · 本地 · 英语"
+            self.video_engine_pill.setText(engine)
+            self.video_source_badge.setText("Whisper 语音" if whisper_is_available() else "Vosk 语音")
             self.video_source_edit.setPlaceholderText(
-                "电脑播放的语音会在这里转写为英文"
+                "电脑播放的语音会在这里自动转写为文字"
             )
             self.video_result_edit.setPlaceholderText("翻译结果会显示在这里")
             self._set_video_status("ready", "点击“开始识别”监听视频声音")
@@ -1183,7 +1184,10 @@ class MainWindow(QMainWindow):
             return
         if (
             importlib.util.find_spec("soundcard") is None
-            or importlib.util.find_spec("vosk") is None
+            or (
+                not whisper_is_available()
+                and importlib.util.find_spec("vosk") is None
+            )
         ):
             self.toast.show_message(
                 "声音转写组件未安装，请运行 pip install -r requirements.txt。",
@@ -1192,14 +1196,16 @@ class MainWindow(QMainWindow):
             )
             return
         source = self._source_code()
-        if source not in {"auto", "en"}:
+        if not whisper_is_available() and source not in {"auto", "en"}:
             self.toast.show_message(
-                "当前电脑声音转写支持英语视频。请把源语言设为“自动检测”或“英语”。",
+                "Whisper 多语言模型尚未安装，当前只能使用英语 Vosk。"
+                "请运行 python scripts/install_whisper_model.py。",
                 "error",
                 4600,
             )
             return
-        transcriber = SystemAudioTranscriber("en", self)
+        language = "auto" if source == "auto" else source
+        transcriber = SystemAudioTranscriber(language, self)
         transcriber.transcript_ready.connect(self._audio_transcript_ready)
         transcriber.status_changed.connect(self._audio_status_changed)
         transcriber.error.connect(self._audio_error)
@@ -1211,9 +1217,18 @@ class MainWindow(QMainWindow):
         self.video_debounce_timer.stop()
         self.video_start_button.setText("停止识别")
         self.video_headline.setText("正在监听电脑声音")
-        self.video_hint.setText("请正常播放视频声音，程序会在本机流式转写并翻译。")
-        self.video_engine_pill.setText("Vosk · 正在启动")
-        self._set_video_status("busy", "正在加载本地 Vosk 语音模型…")
+        self.video_hint.setText(
+            "请正常播放视频声音；程序会按自然停顿自动断句、识别并翻译。"
+        )
+        self.video_engine_pill.setText(
+            "Whisper · 正在启动" if whisper_is_available() else "Vosk · 正在启动"
+        )
+        self._set_video_status(
+            "busy",
+            "正在加载本地 Whisper 多语言模型…"
+            if whisper_is_available()
+            else "正在加载本地 Vosk 语音模型…",
+        )
         if self.video_overlay_check.isChecked():
             self._show_video_overlay()
             if self._overlay is not None:
@@ -1230,7 +1245,12 @@ class MainWindow(QMainWindow):
         if detected != "auto":
             self._audio_detected_language = detected
         language = language_label(detected) if detected != "auto" else "自动识别"
-        self._accept_video_transcript(text, f"Vosk · {language}")
+        engine = (
+            self._audio_transcriber.device_label
+            if self._audio_transcriber is not None
+            else "Whisper"
+        )
+        self._accept_video_transcript(text, f"{engine} · {language}")
 
     def _audio_status_changed(self, message: str) -> None:
         if not self._video_monitoring:

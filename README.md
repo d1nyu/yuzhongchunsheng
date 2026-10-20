@@ -53,10 +53,10 @@ python -m pip install -r requirements.txt
 1. 视频正常播放，声音从默认扬声器输出。
 2. 在“视频翻译”中选择“电脑声音（无需字幕）”。
 3. 点“开始识别”。
-4. 程序通过 Windows 声音回环采集播放器声音，在本机用 Vosk 流式转写成英文。
+4. 程序通过 Windows 声音回环采集播放器声音，在本机用 Whisper 自动识别语言并转写成文字。
 5. 转写结果自动交给 DeepSeek 翻译成中文，并可显示置顶悬浮字幕。
 
-这个模式不占用麦克风，也不需要视频有字幕。当前内置的是英语识别模型，所以源语言请选择“自动检测”或“英语”。音频只在本机处理，不会上传；发送给 DeepSeek 的是转写后的文字。
+这个模式不占用麦克风，也不需要视频有字幕。源语言选择“自动检测”即可识别常见外语；音频只在本机处理，不会上传；发送给 DeepSeek 的是转写后的文字。
 
 #### 画面字幕
 
@@ -74,7 +74,7 @@ python -m pip install -r requirements.txt
 - 框选区域尽量只包含字幕，少包含画面和台标，识别更快也更准。
 - **不要让悬浮字幕挡住框选区域**，否则它可能把自己的译文再次识别进去。程序默认会把悬浮字幕放到字幕区域的反方向。
 - 画面字幕 OCR 当前主要支持**中文和英文**混合字幕。
-- 电脑声音转写当前支持**英语**视频。
+- 电脑声音转写使用本地多语言 Whisper，可识别英语、日语、韩语、法语、德语、西班牙语等常见语言；源语言建议保持“自动检测”。
 - 系统声音模式大约会有一小段延迟，适合连续观看；暂停播放时不会继续产生字幕。
 
 ![电脑声音视频翻译](preview/video-audio-test.png)
@@ -122,16 +122,30 @@ DeepSeek 密钥使用 Windows DPAPI 加密后保存在：
 ## 隐私
 
 - 文字、语音转写结果和字幕文字会发送给所选的在线翻译引擎（默认 DeepSeek）。
-- 语音识别、Vosk 视频声音转写和 OCR 都在本机完成。
+- 语音识别、Whisper/Vosk 视频声音转写和 OCR 都在本机完成。
 - 程序不在本地保存翻译历史；只保存设置、窗口位置和字幕区域坐标。
 
 ## 常见问题
 
 **视频声音模式识别很慢**
 
-系统声音转写会按语音停顿分段，通常每 1～3 秒输出一段。识别质量受背景音乐、说话速度和口音影响。
+系统声音会根据说话中的自然停顿和换气自动断句，检测到约 0.6 秒静音后立即转写，不再使用固定 5 秒切片。识别质量受背景音乐、说话速度和口音影响。
 
-**提示 Vosk 英文模型未安装**
+**提示 Whisper 多语言模型未安装**
+
+运行：
+
+```powershell
+python scripts/install_whisper_model.py
+```
+
+模型默认安装到：
+
+```text
+%PROGRAMDATA%\YiSheng\models\whisper
+```
+
+如果 Whisper 不可用，程序会回退到英语 Vosk 模型。安装 Vosk：
 
 运行：
 
@@ -175,9 +189,9 @@ python -m pytest -q
 - `lingua/main_window.py`：主界面和交互。
 - `lingua/translation.py`：DeepSeek、Google、MyMemory、OpenAI 兼容翻译。
 - `lingua/ocr.py`：视频字幕与屏幕选区截图、本地 OCR。
-- `lingua/audio_translate.py`：系统声音回环采集与 Vosk 流式转写。
+- `lingua/audio_translate.py`：系统声音回环采集、Whisper 多语言转写与 Vosk 英语回退。
 - `lingua/hotkeys.py`：全局快捷键 `Ctrl + Alt + T`。
 - `lingua/overlay.py`：屏幕框选和置顶字幕。
 - `lingua/speech.py`：Windows 语音识别与朗读。
-- `scripts/`：Windows PowerShell 语音辅助脚本和 Vosk 模型安装器。
+- `scripts/`：Windows PowerShell 语音辅助脚本及 Whisper/Vosk 模型安装器。
 

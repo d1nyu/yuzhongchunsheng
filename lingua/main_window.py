@@ -36,6 +36,7 @@ from .languages import (
     detect_language_heuristic,
     language_for_culture,
     language_label,
+    sapi_lcid,
     speech_culture_for_source,
 )
 from .ocr import SubtitleOcrWorker
@@ -100,6 +101,9 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self.installed_recognizers = list_installed_recognizers()
         self.installed_voices = list_sapi_voices()
+        self.installed_voice_languages = {
+            int(item.get("language", 0)) for item in self.installed_voices
+        }
         self.recognizer_cultures = [
             item.get("culture", "")
             for item in self.installed_recognizers
@@ -1500,7 +1504,12 @@ class MainWindow(QMainWindow):
                 )
                 self._show_video_overlay()
         if target_text and self.auto_speak_check.isChecked():
-            if context != "video":
+            target_lcid = sapi_lcid(self._target_code())
+            if (
+                context != "video"
+                and target_lcid is not None
+                and target_lcid in self.installed_voice_languages
+            ):
                 self.speaker.speak(target_text, self._target_code())
 
     def _translation_failed(self, request_id: int, context: str, message: str) -> None:

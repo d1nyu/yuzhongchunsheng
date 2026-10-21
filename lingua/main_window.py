@@ -1394,6 +1394,7 @@ class MainWindow(QMainWindow):
         created = self._overlay is None
         if created:
             self._overlay = SubtitleOverlay()
+            self._overlay.close_requested.connect(self._stop_video_monitoring)
             self._overlay.set_content("正在监听字幕…", "等待画面中出现新的字幕")
         raw_pos = self.settings.get("overlay_pos", [])
         positioned = False

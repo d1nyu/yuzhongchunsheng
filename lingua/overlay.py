@@ -136,6 +136,8 @@ class RegionSelector(QWidget):
 
 
 class SubtitleOverlay(QWidget):
+    close_requested = pyqtSignal()
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowFlags(
@@ -150,6 +152,17 @@ class SubtitleOverlay(QWidget):
         self.setFixedSize(960, 180)
         self.setWindowOpacity(0.97)
         self._drag_offset: QPoint | None = None
+        self.close_button = QPushButton("×", self)
+        self.close_button.setFixedSize(28, 28)
+        self.close_button.setCursor(Qt.PointingHandCursor)
+        self.close_button.setToolTip("停止识别并关闭悬浮字幕")
+        self.close_button.setStyleSheet(
+            "QPushButton{background:rgba(255,255,255,18);color:#E8EEF8;"
+            "border:none;border-radius:8px;font-size:18px;padding:0;}"
+            "QPushButton:hover{background:rgba(255,255,255,42);color:#FFFFFF;}"
+            "QPushButton:pressed{background:rgba(255,255,255,62);}"
+        )
+        self.close_button.clicked.connect(self.close_requested.emit)
         self.source_label = QLabel("等待字幕…")
         self.source_label.setAlignment(Qt.AlignCenter)
         self.source_label.setWordWrap(True)
@@ -167,6 +180,11 @@ class SubtitleOverlay(QWidget):
         layout.setSpacing(5)
         layout.addWidget(self.source_label)
         layout.addWidget(self.translation_label, 1)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self.close_button.move(self.width() - 38, 10)
+        self.close_button.raise_()
 
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         painter = QPainter(self)

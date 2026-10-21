@@ -7,4 +7,5 @@ soundcard==0.4.6
 vosk>=0.3.45
 pywhispercpp>=1.5.1
 webrtcvad>=2.0.10
+sherpa-onnx>=1.13.8
 

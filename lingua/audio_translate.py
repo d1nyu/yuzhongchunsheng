@@ -16,6 +16,13 @@ import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .config import data_models_dir
+from .diarization import (
+    AudioContentGate,
+    SpeakerDiarizer,
+    SpeakerSegment,
+    audio_tagging_is_available,
+    diarization_is_available,
+)
 from .languages import whisper_language
 
 
@@ -155,7 +162,7 @@ class PauseSegmenter:
 
 
 class SystemAudioTranscriber(QObject):
-    transcript_ready = pyqtSignal(str, str)
+    transcript_ready = pyqtSignal(str, str, str, str)
     status_changed = pyqtSignal(str)
     level_changed = pyqtSignal(float)
     error = pyqtSignal(str)
@@ -168,6 +175,7 @@ class SystemAudioTranscriber(QObject):
         self._capture_thread: threading.Thread | None = None
         self._infer_thread: threading.Thread | None = None
         self._last_transcript_key = ""
+        self._last_transcript_speaker = ""
         self.speaker_name = ""
         self.device_label = ""
 
@@ -176,6 +184,7 @@ class SystemAudioTranscriber(QObject):
             return
         self._stop_event.clear()
         self._last_transcript_key = ""
+        self._last_transcript_speaker = ""
         self._audio_queue = queue.Queue(maxsize=80)
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -351,7 +360,23 @@ class SystemAudioTranscriber(QObject):
             redirect_whispercpp_logs_to=False,
         )
         model_label = "small" if "small" in model_path.name else "base"
-        self.device_label = f"Whisper {model_label} · 多语言"
+        diarizer = None
+        content_gate = None
+        if diarization_is_available():
+            try:
+                diarizer = SpeakerDiarizer()
+            except Exception:
+                diarizer = None
+        if audio_tagging_is_available():
+            try:
+                content_gate = AudioContentGate()
+            except Exception:
+                content_gate = None
+        self.device_label = (
+            f"Whisper {model_label} · 分人"
+            if diarizer is not None
+            else f"Whisper {model_label} · 多语言"
+        )
         if not self._stop_event.is_set():
             self.status_changed.emit(
                 "Whisper 多语言已就绪 · 正在聆听电脑播放的声音…"
@@ -368,7 +393,8 @@ class SystemAudioTranscriber(QObject):
                 language = ""
                 detected_language = ""
                 auto_detect = True
-        asr_prompt = ""
+        default_language = detected_language
+        asr_states: dict[str, tuple[str, str]] = {}
         segmenter = PauseSegmenter()
         while not self._stop_event.is_set():
             try:
@@ -381,22 +407,102 @@ class SystemAudioTranscriber(QObject):
                 continue
             chunk = segmenter.add_block(item)
             if chunk is not None:
-                detected_language, asr_prompt = self._transcribe_whisper_segment(
-                    model,
-                    chunk,
-                    auto_detect,
-                    detected_language,
-                    asr_prompt,
+                content_warning = ""
+                if content_gate is not None:
+                    content = content_gate.classify(chunk)
+                    if content.music_only:
+                        self.status_changed.emit(
+                            "检测到音乐或歌词，已跳过该片段"
+                        )
+                        continue
+                    if content.music_overlap:
+                        content_warning = "音乐或歌词与对白重叠，内容可能不完整"
+                        self.status_changed.emit(
+                            "检测到音乐或歌词与对白重叠，翻译可能不完整"
+                        )
+                speaker_chunks = (
+                    diarizer.segment(chunk)
+                    if diarizer is not None
+                    else [
+                        SpeakerSegment(
+                            "",
+                            chunk,
+                            0.0,
+                            chunk.size / SAMPLE_RATE,
+                        )
+                    ]
                 )
+                for speaker_chunk in speaker_chunks:
+                    speaker = speaker_chunk.speaker
+                    warning = content_warning
+                    if speaker_chunk.overlap:
+                        speaker = "多人重叠"
+                        warning = "多人同时说话，内容可能不完整"
+                        if content_warning:
+                            warning = f"{content_warning}；{warning}"
+                    speaker_language, speaker_prompt = asr_states.get(
+                        speaker,
+                        (default_language, ""),
+                    )
+                    detected_language, prompt = self._transcribe_whisper_segment(
+                        model,
+                        speaker_chunk.audio,
+                        auto_detect,
+                        speaker_language,
+                        speaker_prompt,
+                        speaker,
+                        warning,
+                    )
+                    asr_states[speaker] = (detected_language, prompt)
         final_chunk = segmenter.flush()
         if final_chunk is not None and not self._stop_event.is_set():
-            self._transcribe_whisper_segment(
-                model,
-                final_chunk,
-                auto_detect,
-                detected_language,
-                asr_prompt,
+            content_warning = ""
+            if content_gate is not None:
+                content = content_gate.classify(final_chunk)
+                if content.music_only:
+                    self.status_changed.emit(
+                        "检测到音乐或歌词，已跳过该片段"
+                    )
+                    return
+                if content.music_overlap:
+                    content_warning = "音乐或歌词与对白重叠，内容可能不完整"
+                    self.status_changed.emit(
+                        "检测到音乐或歌词与对白重叠，翻译可能不完整"
+                    )
+            speaker_chunks = (
+                diarizer.segment(final_chunk)
+                if diarizer is not None
+                else [
+                    SpeakerSegment(
+                        "",
+                        final_chunk,
+                        0.0,
+                        final_chunk.size / SAMPLE_RATE,
+                    )
+                ]
             )
+            for speaker_chunk in speaker_chunks:
+                speaker = speaker_chunk.speaker
+                warning = content_warning
+                if speaker_chunk.overlap:
+                    speaker = "多人重叠"
+                    warning = "多人同时说话，内容可能不完整"
+                    if content_warning:
+                        warning = f"{content_warning}；{warning}"
+                speaker_language, speaker_prompt = asr_states.get(
+                    speaker,
+                    (default_language, ""),
+                )
+                detected_language, prompt = self._transcribe_whisper_segment(
+                    model,
+                    speaker_chunk.audio,
+                    auto_detect,
+                    speaker_language,
+                    speaker_prompt,
+                    speaker,
+                    warning,
+                )
+                asr_states[speaker] = (detected_language, prompt)
 
     def _transcribe_whisper_segment(
         self,
@@ -405,6 +511,8 @@ class SystemAudioTranscriber(QObject):
         auto_detect: bool,
         detected_language: str,
         asr_prompt: str,
+        speaker: str = "",
+        content_warning: str = "",
     ) -> tuple[str, str]:
         rms = float(np.sqrt(np.mean(np.square(chunk))))
         if rms < 0.00035:
@@ -449,12 +557,18 @@ class SystemAudioTranscriber(QObject):
             for segment in segments
             if segment.text and segment.text.strip()
         )
-        self._emit_text(text, detected_language)
+        self._emit_text(text, detected_language, speaker, content_warning)
         if text:
             asr_prompt = (asr_prompt + " " + text).strip()[-220:]
         return detected_language, asr_prompt
 
-    def _emit_text(self, text: str, language_code: str | None = None) -> None:
+    def _emit_text(
+        self,
+        text: str,
+        language_code: str | None = None,
+        speaker: str = "",
+        content_warning: str = "",
+    ) -> None:
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return
@@ -473,10 +587,17 @@ class SystemAudioTranscriber(QObject):
         if not key:
             return
         if (
-            self._last_transcript_key
+            speaker == self._last_transcript_speaker
+            and self._last_transcript_key
             and SequenceMatcher(None, key, self._last_transcript_key).ratio() > 0.985
         ):
             return
         self._last_transcript_key = key
-        self.transcript_ready.emit(text, language_code or self.language)
+        self._last_transcript_speaker = speaker
+        self.transcript_ready.emit(
+            text,
+            language_code or self.language,
+            speaker,
+            content_warning,
+        )
 

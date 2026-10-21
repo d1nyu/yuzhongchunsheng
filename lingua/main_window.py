@@ -8,7 +8,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from PyQt5.QtCore import QByteArray, QRect, QTimer, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QKeySequence, QPixmap
+from PyQt5.QtGui import QKeySequence, QPixmap, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -135,8 +135,16 @@ class MainWindow(QMainWindow):
         self._region_selector: RegionSelector | None = None
         self._overlay: SubtitleOverlay | None = None
         self._last_video_ocr_key = ""
+        self._last_video_ocr_speaker = ""
         self._last_video_translated_source = ""
         self._video_history: list[str] = []
+        self._video_entries: list[dict[str, Any]] = []
+        self._video_entry_seq = 0
+        self._current_video_entry_id: int | None = None
+        self._video_pending_entries: dict[int, int] = {}
+        self._video_legacy_requests: set[int] = set()
+        self._video_translation_queue: list[int] = []
+        self._video_speakers: set[str] = set()
         self._audio_detected_language = ""
         self._audio_transcriber: SystemAudioTranscriber | None = None
         self._text_ocr_worker: SubtitleOcrWorker | None = None
@@ -606,7 +614,7 @@ class MainWindow(QMainWindow):
         source_layout.setContentsMargins(17, 14, 17, 11)
         source_layout.setSpacing(8)
         source_header = QHBoxLayout()
-        source_title = QLabel("识别内容")
+        source_title = QLabel("对话记录")
         source_title.setObjectName("CardTitle")
         source_header.addWidget(source_title)
         self.video_source_badge = QLabel("本地 OCR")
@@ -617,6 +625,7 @@ class MainWindow(QMainWindow):
         source_layout.addWidget(self._separator())
         self.video_source_edit = QTextEdit()
         self.video_source_edit.setObjectName("VoiceSourceEdit")
+        self.video_source_edit.setReadOnly(True)
         self.video_source_edit.setAcceptRichText(False)
         self.video_source_edit.setPlaceholderText("框选字幕区域后，识别出的字幕会显示在这里")
         self.video_source_edit.textChanged.connect(self._video_text_changed)
@@ -629,7 +638,7 @@ class MainWindow(QMainWindow):
         result_layout.setContentsMargins(17, 14, 17, 11)
         result_layout.setSpacing(8)
         result_header = QHBoxLayout()
-        result_title = QLabel("译文")
+        result_title = QLabel("译文记录")
         result_title.setObjectName("CardTitle")
         result_header.addWidget(result_title)
         self.video_target_badge = QLabel("中文（简体）")
@@ -672,9 +681,10 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.video_status_dot)
         action_row.addWidget(self.video_status)
         action_row.addStretch()
-        self.video_translate_button = QPushButton("重新翻译")
+        self.video_translate_button = QPushButton("重新翻译最新一条")
         self.video_translate_button.setObjectName("SecondaryButton")
         self.video_translate_button.setEnabled(False)
+        self.video_translate_button.setToolTip("重新翻译对话记录中的最后一条")
         self.video_translate_button.clicked.connect(lambda: self._translate_current(True))
         action_row.addWidget(self.video_translate_button)
         layout.addLayout(action_row)
@@ -917,7 +927,8 @@ class MainWindow(QMainWindow):
         if mode == "audio":
             self.video_headline.setText("用电脑声音实时翻译视频")
             self.video_hint.setText(
-                "无需字幕。Whisper 自动识别语言，并按说话停顿断句后交给 DeepSeek 翻译。"
+                "无需字幕。自动识别语言和说话人；多人会默认全部显示，"
+                "纯音乐与歌词片段会自动跳过。"
             )
             self.video_region_label.setText(
                 "声音来源：默认扬声器回环 · 不占用麦克风"
@@ -932,9 +943,9 @@ class MainWindow(QMainWindow):
             self.video_engine_pill.setText(engine)
             self.video_source_badge.setText("Whisper 语音" if whisper_is_available() else "Vosk 语音")
             self.video_source_edit.setPlaceholderText(
-                "电脑播放的语音会在这里自动转写为文字"
+                "所有说话人的识别内容会按时间顺序保留在这里"
             )
-            self.video_result_edit.setPlaceholderText("翻译结果会显示在这里")
+            self.video_result_edit.setPlaceholderText("所有说话人的译文会对应显示在这里")
             self._set_video_status("ready", "点击“开始识别”监听视频声音")
         else:
             self.video_headline.setText("框选字幕区域，实时看懂视频")
@@ -1176,9 +1187,10 @@ class MainWindow(QMainWindow):
             worker.start()
         self._video_monitoring = True
         self._last_video_ocr_key = ""
+        self._last_video_ocr_speaker = ""
         self._last_video_translated_source = ""
         self._audio_detected_language = ""
-        self._video_history = []
+        self._reset_video_session()
         self.video_debounce_timer.stop()
         self.video_start_button.setText("停止识别")
         self.video_headline.setText("正在实时识别字幕")
@@ -1222,14 +1234,15 @@ class MainWindow(QMainWindow):
         self._audio_transcriber = transcriber
         self._video_monitoring = True
         self._last_video_ocr_key = ""
+        self._last_video_ocr_speaker = ""
         self._last_video_translated_source = ""
         self._audio_detected_language = ""
-        self._video_history = []
+        self._reset_video_session()
         self.video_debounce_timer.stop()
         self.video_start_button.setText("停止识别")
         self.video_headline.setText("正在监听电脑声音")
         self.video_hint.setText(
-            "请正常播放视频声音；程序会按自然停顿自动断句、识别并翻译。"
+            "请正常播放视频声音；程序会自动分人、跳过纯音乐，并逐条翻译。"
         )
         self.video_engine_pill.setText(
             "Whisper · 正在启动" if whisper_is_available() else "Vosk · 正在启动"
@@ -1249,7 +1262,25 @@ class MainWindow(QMainWindow):
                 )
         transcriber.start()
 
-    def _audio_transcript_ready(self, text: str, language_code: str) -> None:
+    def _reset_video_session(self) -> None:
+        self._video_history = []
+        self._video_entries = []
+        self._video_entry_seq = 0
+        self._current_video_entry_id = None
+        self._video_pending_entries.clear()
+        self._video_legacy_requests.clear()
+        self._video_translation_queue.clear()
+        self._video_speakers.clear()
+        self.video_source_edit.clear()
+        self.video_result_edit.clear()
+
+    def _audio_transcript_ready(
+        self,
+        text: str,
+        language_code: str,
+        speaker: str,
+        content_warning: str,
+    ) -> None:
         if not self._video_monitoring:
             return
         detected = app_language_from_asr(language_code)
@@ -1261,7 +1292,14 @@ class MainWindow(QMainWindow):
             if self._audio_transcriber is not None
             else "Whisper"
         )
-        self._accept_video_transcript(text, f"{engine} · {language}")
+        self._accept_video_transcript(
+            text,
+            f"{engine} · {language}",
+            speaker or "说话人 1",
+            detected,
+            queue_immediately=True,
+            content_warning=content_warning,
+        )
 
     def _audio_status_changed(self, message: str) -> None:
         if not self._video_monitoring:
@@ -1335,33 +1373,181 @@ class MainWindow(QMainWindow):
             return
         self._accept_video_transcript(text, "本地 OCR")
 
-    def _accept_video_transcript(self, text: str, source_label: str) -> None:
+    def _accept_video_transcript(
+        self,
+        text: str,
+        source_label: str,
+        speaker: str = "",
+        language_code: str = "",
+        queue_immediately: bool = False,
+        content_warning: str = "",
+    ) -> None:
         text = text.strip()
         if not text:
             return
         key = re.sub(r"[\W_]+", "", text.lower())
         if not key:
             return
-        if key == self._last_video_ocr_key:
-            return
-        if (
-            self._last_video_ocr_key
-            and SequenceMatcher(None, key, self._last_video_ocr_key).ratio() > 0.985
-        ):
-            return
+        if speaker == self._last_video_ocr_speaker:
+            if key == self._last_video_ocr_key:
+                return
+            if (
+                self._last_video_ocr_key
+                and SequenceMatcher(None, key, self._last_video_ocr_key).ratio() > 0.985
+            ):
+                return
         self._last_video_ocr_key = key
-        if not self._video_history or self._video_history[-1] != text:
-            self._video_history.append(text)
-            self._video_history = self._video_history[-4:]
-        self.video_source_edit.setPlainText(text)
+        self._last_video_ocr_speaker = speaker
+        self._video_history.append(text)
+        self._video_history = self._video_history[-12:]
+        self._video_entry_seq += 1
+        entry_id = self._video_entry_seq
+        entry: dict[str, Any] = {
+            "id": entry_id,
+            "speaker": speaker,
+            "source": text,
+            "translation": "",
+            "status": "pending" if queue_immediately else "draft",
+            "source_label": source_label,
+            "language_code": language_code,
+            "provider": "",
+            "warning": content_warning.strip(),
+        }
+        self._video_entries.append(entry)
+        if speaker:
+            self._video_speakers.add(speaker)
+        self._current_video_entry_id = entry_id
+        self._render_video_entries()
         self.video_source_badge.setText(source_label)
         self.video_translate_button.setEnabled(True)
         self._set_video_status("busy", "检测到新内容，准备翻译…")
-        if self.video_overlay_check.isChecked():
-            self._show_video_overlay()
-            if self._overlay is not None:
-                self._overlay.set_content(text, "正在翻译…")
-        self.video_debounce_timer.start()
+        self._update_video_overlay()
+        if queue_immediately:
+            self._queue_video_entry_translation(entry_id)
+        else:
+            self.video_debounce_timer.start()
+
+    def _find_video_entry(self, entry_id: int) -> dict[str, Any] | None:
+        return next(
+            (
+                entry
+                for entry in self._video_entries
+                if int(entry.get("id", -1)) == entry_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _video_speaker_prefix(entry: dict[str, Any]) -> str:
+        speaker = str(entry.get("speaker", "")).strip()
+        return f"{speaker}：" if speaker else ""
+
+    def _render_video_entries(self) -> None:
+        source_lines: list[str] = []
+        result_lines: list[str] = []
+        for entry in self._video_entries:
+            prefix = self._video_speaker_prefix(entry)
+            warning = str(entry.get("warning", "")).strip()
+            source_text = prefix + str(entry.get("source", ""))
+            if warning:
+                source_text += f"\n〔{warning}〕"
+            source_lines.append(source_text)
+            status = str(entry.get("status", ""))
+            if status == "done":
+                target = str(entry.get("translation", "")).strip()
+            elif status == "error":
+                target = str(entry.get("translation", "")).strip() or "翻译失败"
+            else:
+                target = "正在翻译…"
+            result_text = prefix + target
+            if warning and status in {"done", "error"}:
+                result_text += f"\n〔{warning}〕"
+            result_lines.append(result_text)
+        self.video_source_edit.setPlainText("\n\n".join(source_lines))
+        self.video_result_edit.setPlainText("\n\n".join(result_lines))
+        self.video_source_edit.moveCursor(QTextCursor.End)
+        self.video_result_edit.moveCursor(QTextCursor.End)
+
+    def _update_video_overlay(self) -> None:
+        if (
+            not self._video_monitoring
+            or not self.video_overlay_check.isChecked()
+            or not self._video_entries
+        ):
+            return
+        self._show_video_overlay()
+        if self._overlay is None:
+            return
+        entries: list[tuple[str, str, str]] = []
+        for entry in self._video_entries[-3:]:
+            status = str(entry.get("status", ""))
+            if status == "done":
+                target = str(entry.get("translation", "")).strip()
+            elif status == "error":
+                target = str(entry.get("translation", "")).strip() or "翻译失败"
+            else:
+                target = "正在翻译…"
+            entries.append(
+                (
+                    str(entry.get("speaker", "")),
+                    str(entry.get("source", "")),
+                    target
+                    + (
+                        "〔可能不完整〕"
+                        if str(entry.get("warning", "")).strip()
+                        and status in {"done", "error"}
+                        else ""
+                    ),
+                )
+            )
+        self._overlay.set_entries(entries)
+
+    def _queue_video_entry_translation(self, entry_id: int) -> None:
+        entry = self._find_video_entry(entry_id)
+        if entry is None or str(entry.get("status", "")) in {"done", "translating"}:
+            return
+        if entry_id not in self._video_translation_queue:
+            self._video_translation_queue.append(entry_id)
+        self._start_next_video_translation()
+
+    def _start_next_video_translation(self) -> None:
+        if self._video_pending_entries:
+            return
+        while self._video_translation_queue:
+            entry_id = self._video_translation_queue.pop(0)
+            entry = self._find_video_entry(entry_id)
+            if entry is None or str(entry.get("status", "")) == "done":
+                continue
+            self._current_video_entry_id = entry_id
+            self._start_translation(
+                "video",
+                user_initiated=False,
+                video_entry_id=entry_id,
+            )
+            return
+
+    def _video_translation_context(self, entry: dict[str, Any]) -> str:
+        entry_id = int(entry.get("id", 0))
+        speaker = str(entry.get("speaker", "")).strip()
+        previous = [
+            item
+            for item in self._video_entries
+            if int(item.get("id", 0)) < entry_id
+            and str(item.get("source", "")).strip()
+        ]
+        if speaker == "多人重叠":
+            previous = [
+                item for item in previous if str(item.get("speaker", "")) != speaker
+            ]
+        elif speaker:
+            previous = [
+                item for item in previous if str(item.get("speaker", "")) == speaker
+            ]
+        lines = []
+        for item in previous[-3:]:
+            prefix = self._video_speaker_prefix(item)
+            lines.append(prefix + str(item.get("source", "")).strip())
+        return "\n".join(lines)
 
     def _video_ocr_error(self, message: str) -> None:
         self._set_video_status("error", "字幕识别失败", message)
@@ -1370,14 +1556,19 @@ class MainWindow(QMainWindow):
     def _translate_video_subtitle(self) -> None:
         if not self._video_monitoring:
             return
-        text = self.video_source_edit.toPlainText().strip()
-        if not text or text == self._last_video_translated_source:
-            return
-        self._start_translation("video", user_initiated=False)
+        pending = [
+            int(entry.get("id", 0))
+            for entry in self._video_entries
+            if str(entry.get("status", "")) == "draft"
+        ]
+        for entry_id in pending:
+            self._queue_video_entry_translation(entry_id)
 
     def _video_text_changed(self) -> None:
         self.video_translate_button.setEnabled(
             bool(self.video_source_edit.toPlainText().strip())
+            and not self._video_pending_entries
+            and not self._video_translation_queue
         )
 
     def _video_overlay_toggled(self, enabled: bool) -> None:
@@ -1387,6 +1578,7 @@ class MainWindow(QMainWindow):
             return
         if enabled:
             self._show_video_overlay()
+            self._update_video_overlay()
         elif self._overlay is not None:
             self._overlay.hide()
 
@@ -1446,9 +1638,45 @@ class MainWindow(QMainWindow):
 
     def _translate_current(self, user_initiated: bool = True) -> None:
         context = ("text", "voice", "video")[self._mode]
+        if context == "video" and self._video_entries:
+            self._retranslate_latest_video_entry()
+            return
         self._start_translation(context, user_initiated)
 
-    def _start_translation(self, context: str, user_initiated: bool = True) -> None:
+    def _retranslate_latest_video_entry(self) -> None:
+        if not self._video_entries:
+            if self.video_source_edit.toPlainText().strip():
+                self._start_translation("video", user_initiated=True)
+            return
+        entry = self._video_entries[-1]
+        entry["status"] = "pending"
+        entry["translation"] = ""
+        entry["provider"] = ""
+        self._render_video_entries()
+        self._update_video_overlay()
+        self._queue_video_entry_translation(int(entry["id"]))
+
+    def _fail_video_entry(
+        self,
+        entry: dict[str, Any],
+        message: str,
+    ) -> None:
+        entry["status"] = "error"
+        entry["translation"] = message
+        entry["provider"] = ""
+        self._render_video_entries()
+        self._set_video_status("error", "字幕翻译失败", message)
+        self._update_video_overlay()
+        if not self._video_pending_entries:
+            self._start_next_video_translation()
+
+    def _start_translation(
+        self,
+        context: str,
+        user_initiated: bool = True,
+        video_entry_id: int | None = None,
+    ) -> None:
+        video_entry: dict[str, Any] | None = None
         if context == "text":
             text = self.source_edit.toPlainText().strip()
             source = self._source_code()
@@ -1459,20 +1687,41 @@ class MainWindow(QMainWindow):
             text = self.voice_source_edit.toPlainText().strip()
             source = self._speech_source_culture or self._source_code()
         else:
-            text = self.video_source_edit.toPlainText().strip()
-            source = self._source_code()
-            if (
-                source == "auto"
-                and self._video_source_mode() == "audio"
-                and self._audio_detected_language
-            ):
-                source = self._audio_detected_language
+            if video_entry_id is not None:
+                video_entry = self._find_video_entry(video_entry_id)
+                if video_entry is None:
+                    self._start_next_video_translation()
+                    return
+                text = str(video_entry.get("source", "")).strip()
+                source = (
+                    str(video_entry.get("language_code", "")).strip()
+                    or self._source_code()
+                )
+            else:
+                text = self.video_source_edit.toPlainText().strip()
+                source = self._source_code()
+                if (
+                    source == "auto"
+                    and self._video_source_mode() == "audio"
+                    and self._audio_detected_language
+                ):
+                    source = self._audio_detected_language
 
         if not text:
+            if video_entry is not None:
+                self._fail_video_entry(
+                    video_entry,
+                    "没有可翻译的识别内容。",
+                )
             if user_initiated:
                 self.toast.show_message("请先输入或识别一段文字。", "info")
             return
         if len(text) > self.MAX_CHARS:
+            if video_entry is not None:
+                self._fail_video_entry(
+                    video_entry,
+                    "单条识别内容超过 5000 个字符。",
+                )
             self.toast.show_message("内容超过 5000 个字符，请分段翻译。", "error")
             return
         if source == "auto" and context == "voice":
@@ -1496,6 +1745,8 @@ class MainWindow(QMainWindow):
                     self._quick_popup.set_error(message)
             else:
                 self._set_video_status("error", "请先配置翻译引擎")
+                if video_entry is not None:
+                    self._fail_video_entry(video_entry, message)
             if user_initiated:
                 QTimer.singleShot(250, self._open_settings)
             return
@@ -1510,10 +1761,18 @@ class MainWindow(QMainWindow):
         target = self._target_code()
         translation_context = ""
         if context == "video":
-            previous_lines = [
-                line for line in self._video_history if line != text
-            ][-3:]
-            translation_context = "\n".join(previous_lines)
+            if video_entry is not None:
+                translation_context = self._video_translation_context(video_entry)
+                self._video_pending_entries[request_id] = int(video_entry["id"])
+                video_entry["status"] = "translating"
+                self._render_video_entries()
+                self._update_video_overlay()
+            else:
+                self._video_legacy_requests.add(request_id)
+                previous_lines = [
+                    line for line in self._video_history if line != text
+                ][-3:]
+                translation_context = "\n".join(previous_lines)
         engine_label = ENGINE_LABELS.get(engine, engine)
         if context == "text":
             self.translate_button.setEnabled(False)
@@ -1554,6 +1813,53 @@ class MainWindow(QMainWindow):
     def _translation_succeeded(
         self, request_id: int, context: str, result: TranslationResult
     ) -> None:
+        if context == "video":
+            entry_id = self._video_pending_entries.pop(request_id, None)
+            if entry_id is not None:
+                entry = self._find_video_entry(entry_id)
+                if entry is not None:
+                    entry["translation"] = result.text
+                    entry["provider"] = result.provider
+                    entry["status"] = "done"
+                    if result.detected_language:
+                        entry["language_code"] = result.detected_language
+                    self._last_video_translated_source = str(
+                        entry.get("source", "")
+                    ).strip()
+                    self.video_provider_badge.setText(result.provider)
+                    self.video_provider_badge.setVisible(True)
+                    self.video_translate_button.setText("重新翻译最新一条")
+                    self.video_translate_button.setEnabled(
+                        not self._video_translation_queue
+                    )
+                    speaker_count = len(
+                        {
+                            name
+                            for name in self._video_speakers
+                            if name.startswith("说话人")
+                        }
+                    )
+                    if self._video_source_mode() == "audio":
+                        if speaker_count:
+                            message = (
+                                f"已翻译 {speaker_count} 位说话人的对话 · "
+                                f"{result.provider}"
+                            )
+                        else:
+                            message = f"已翻译对话 · {result.provider}"
+                    else:
+                        message = f"字幕已翻译 · {result.provider}"
+                    self._set_video_status("success", message)
+                    self._render_video_entries()
+                    self._update_video_overlay()
+                self._translating = bool(
+                    self._video_pending_entries or self._video_translation_queue
+                )
+                self._start_next_video_translation()
+                return
+            if request_id not in self._video_legacy_requests:
+                return
+            self._video_legacy_requests.discard(request_id)
         if context == "quick":
             if request_id != self._quick_seq:
                 return
@@ -1627,6 +1933,20 @@ class MainWindow(QMainWindow):
                 self.speaker.speak(target_text, self._target_code())
 
     def _translation_failed(self, request_id: int, context: str, message: str) -> None:
+        if context == "video":
+            entry_id = self._video_pending_entries.pop(request_id, None)
+            if entry_id is not None:
+                entry = self._find_video_entry(entry_id)
+                if entry is not None:
+                    self._fail_video_entry(entry, message)
+                self._translating = bool(
+                    self._video_pending_entries or self._video_translation_queue
+                )
+                self.toast.show_message(message, "error", 5200)
+                return
+            if request_id not in self._video_legacy_requests:
+                return
+            self._video_legacy_requests.discard(request_id)
         if context == "quick":
             if request_id != self._quick_seq:
                 return

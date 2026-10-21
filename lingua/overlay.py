@@ -149,7 +149,7 @@ class SubtitleOverlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowTitle("羽中纯声悬浮字幕")
-        self.setFixedSize(960, 180)
+        self.setFixedSize(960, 210)
         self.setWindowOpacity(0.97)
         self._drag_offset: QPoint | None = None
         self.close_button = QPushButton("×", self)
@@ -173,7 +173,7 @@ class SubtitleOverlay(QWidget):
         self.translation_label.setAlignment(Qt.AlignCenter)
         self.translation_label.setWordWrap(True)
         self.translation_label.setStyleSheet(
-            "color:#FFFFFF;font-size:23px;font-weight:600;background:transparent;"
+            "color:#FFFFFF;font-size:18px;font-weight:600;background:transparent;"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 22, 28, 22)
@@ -201,13 +201,23 @@ class SubtitleOverlay(QWidget):
         self.source_label.setText(source.strip())
         self.translation_label.setText(translation.strip())
 
+    def set_entries(self, entries: list[tuple[str, str, str]]) -> None:
+        sources: list[str] = []
+        translations: list[str] = []
+        for speaker, source, translation in entries[-3:]:
+            prefix = f"{speaker.strip()}：" if speaker.strip() else ""
+            sources.append(prefix + source.strip())
+            translations.append(prefix + translation.strip())
+        self.source_label.setText("\n".join(sources))
+        self.translation_label.setText("\n".join(translations))
+
     def place_away_from(self, region: QRect) -> None:
         screen = QApplication.screenAt(region.center()) or QApplication.primaryScreen()
         if screen is None:
             return
         area = screen.availableGeometry()
         width = min(1080, max(620, int(area.width() * 0.72)))
-        self.resize(width, 180)
+        self.resize(width, 210)
         x = area.x() + int((area.width() - width) / 2)
         if region.center().y() > area.center().y():
             y = area.y() + 34
@@ -221,7 +231,7 @@ class SubtitleOverlay(QWidget):
             return
         area = screen.availableGeometry()
         width = min(1080, max(620, int(area.width() * 0.72)))
-        self.resize(width, 180)
+        self.resize(width, 210)
         self.move(
             area.x() + int((area.width() - width) / 2),
             area.y() + area.height() - self.height() - 74,

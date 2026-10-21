@@ -51,7 +51,13 @@ class TranslationService:
             }
         )
 
-    def translate(self, text: str, source: str, target: str) -> TranslationResult:
+    def translate(
+        self,
+        text: str,
+        source: str,
+        target: str,
+        context: str = "",
+    ) -> TranslationResult:
         text = text.strip()
         if not text:
             raise TranslationError("请输入需要翻译的内容。")
@@ -63,9 +69,9 @@ class TranslationService:
             return TranslationResult(text, "无需翻译", source)
 
         if self.engine == "deepseek":
-            return self._chat_translate(text, source, target, "deepseek")
+            return self._chat_translate(text, source, target, "deepseek", context)
         if self.engine == "openai":
-            return self._chat_translate(text, source, target, "openai")
+            return self._chat_translate(text, source, target, "openai", context)
         if self.engine == "mymemory":
             return self._mymemory_with_fallback(text, source, target)
         return self._google_with_fallback(text, source, target)
@@ -179,6 +185,7 @@ class TranslationService:
         source: str,
         target: str,
         provider: str,
+        context: str = "",
     ) -> TranslationResult:
         if provider == "deepseek":
             api_key = reveal_secret(str(self.settings.get("deepseek_api_key", "")))
@@ -208,12 +215,21 @@ class TranslationService:
             "You are a precise professional translation engine. "
             "Translate the user's text into the requested target language. "
             "Preserve meaning, tone, names, formatting and line breaks. "
-            "Do not add explanations, notes or quotation marks. "
+            "Use the supplied nearby context only to resolve pronouns, terminology "
+            "and implied meaning. Do not translate or repeat the context. "
+            "Do not summarize, answer, explain, or add notes or quotation marks. "
             "Return only the translated text."
         )
+        context_block = ""
+        if context.strip():
+            context_block = (
+                "Nearby context (do not translate or repeat):\n"
+                f"{context.strip()}\n\n"
+            )
         user_prompt = (
             f"Source language: {source_name}\n"
             f"Target language: {target_name}\n\n"
+            f"{context_block}"
             f"Text to translate:\n{text}"
         )
         headers = {

@@ -77,7 +77,12 @@ def test_deepseek_endpoint_and_parsing():
         )
     )
 
-    result = service.translate("你好，很高兴认识你。", "zh-CN", "en")
+    result = service.translate(
+        "你好，很高兴认识你。",
+        "zh-CN",
+        "en",
+        context="A previous line about introducing a friend.",
+    )
 
     assert result.text == "Hello, nice to meet you."
     assert result.provider == "DeepSeek"
@@ -85,6 +90,9 @@ def test_deepseek_endpoint_and_parsing():
     assert call.args[0] == "https://api.deepseek.com/chat/completions"
     assert call.kwargs["headers"]["Authorization"] == "Bearer test-key"
     assert call.kwargs["json"]["model"] == "deepseek-chat"
+    user_prompt = call.kwargs["json"]["messages"][1]["content"]
+    assert "Nearby context" in user_prompt
+    assert "introducing a friend" in user_prompt
 
 
 def test_language_heuristic():

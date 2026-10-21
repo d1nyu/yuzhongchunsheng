@@ -74,6 +74,7 @@ class TranslateWorker(QThread):
         text: str,
         source: str,
         target: str,
+        translation_context: str = "",
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
@@ -83,11 +84,17 @@ class TranslateWorker(QThread):
         self.text = text
         self.source = source
         self.target = target
+        self.translation_context = translation_context
 
     def run(self) -> None:
         try:
             service = TranslationService(self.settings)
-            result = service.translate(self.text, self.source, self.target)
+            result = service.translate(
+                self.text,
+                self.source,
+                self.target,
+                context=self.translation_context,
+            )
             self.result_ready.emit(self.request_id, self.context, result)
         except Exception as exc:
             self.error_ready.emit(self.request_id, self.context, str(exc))
@@ -128,6 +135,7 @@ class MainWindow(QMainWindow):
         self._overlay: SubtitleOverlay | None = None
         self._last_video_ocr_key = ""
         self._last_video_translated_source = ""
+        self._video_history: list[str] = []
         self._audio_detected_language = ""
         self._audio_transcriber: SystemAudioTranscriber | None = None
         self._text_ocr_worker: SubtitleOcrWorker | None = None
@@ -1169,6 +1177,7 @@ class MainWindow(QMainWindow):
         self._last_video_ocr_key = ""
         self._last_video_translated_source = ""
         self._audio_detected_language = ""
+        self._video_history = []
         self.video_debounce_timer.stop()
         self.video_start_button.setText("停止识别")
         self.video_headline.setText("正在实时识别字幕")
@@ -1214,6 +1223,7 @@ class MainWindow(QMainWindow):
         self._last_video_ocr_key = ""
         self._last_video_translated_source = ""
         self._audio_detected_language = ""
+        self._video_history = []
         self.video_debounce_timer.stop()
         self.video_start_button.setText("停止识别")
         self.video_headline.setText("正在监听电脑声音")
@@ -1335,10 +1345,13 @@ class MainWindow(QMainWindow):
             return
         if (
             self._last_video_ocr_key
-            and SequenceMatcher(None, key, self._last_video_ocr_key).ratio() > 0.965
+            and SequenceMatcher(None, key, self._last_video_ocr_key).ratio() > 0.985
         ):
             return
         self._last_video_ocr_key = key
+        if not self._video_history or self._video_history[-1] != text:
+            self._video_history.append(text)
+            self._video_history = self._video_history[-4:]
         self.video_source_edit.setPlainText(text)
         self.video_source_badge.setText(source_label)
         self.video_translate_button.setEnabled(True)
@@ -1493,6 +1506,12 @@ class MainWindow(QMainWindow):
             request_id = self._request_seq
             self._translating = True
         target = self._target_code()
+        translation_context = ""
+        if context == "video":
+            previous_lines = [
+                line for line in self._video_history if line != text
+            ][-3:]
+            translation_context = "\n".join(previous_lines)
         engine_label = ENGINE_LABELS.get(engine, engine)
         if context == "text":
             self.translate_button.setEnabled(False)
@@ -1521,6 +1540,7 @@ class MainWindow(QMainWindow):
             text,
             source,
             target,
+            translation_context,
             self,
         )
         worker.result_ready.connect(self._translation_succeeded)

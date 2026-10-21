@@ -386,9 +386,13 @@ class SystemAudioTranscriber(QObject):
             return detected_language
         peak = float(np.max(np.abs(chunk)))
         chunk = np.clip(chunk / max(peak, 0.04) * 0.78, -1.0, 1.0)
-        if auto_detect and not detected_language:
+        if auto_detect:
             detection = model.auto_detect_language(chunk.astype(np.float32))
-            detected_language = detection[0][0]
+            new_language, probability = detection[0]
+            if new_language and (
+                float(probability) >= 0.55 or not detected_language
+            ):
+                detected_language = new_language
             if not detected_language:
                 return ""
         segments = model.transcribe(
@@ -434,7 +438,7 @@ class SystemAudioTranscriber(QObject):
             return
         if (
             self._last_transcript_key
-            and SequenceMatcher(None, key, self._last_transcript_key).ratio() > 0.92
+            and SequenceMatcher(None, key, self._last_transcript_key).ratio() > 0.985
         ):
             return
         self._last_transcript_key = key

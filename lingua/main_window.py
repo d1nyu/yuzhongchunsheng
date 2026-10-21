@@ -94,6 +94,7 @@ class TranslateWorker(QThread):
                 self.source,
                 self.target,
                 context=self.translation_context,
+                style="spoken" if self.context in {"video", "voice"} else "natural",
             )
             self.result_ready.emit(self.request_id, self.context, result)
         except Exception as exc:

@@ -82,6 +82,7 @@ def test_deepseek_endpoint_and_parsing():
         "zh-CN",
         "en",
         context="A previous line about introducing a friend.",
+        style="spoken",
     )
 
     assert result.text == "Hello, nice to meet you."
@@ -93,6 +94,11 @@ def test_deepseek_endpoint_and_parsing():
     user_prompt = call.kwargs["json"]["messages"][1]["content"]
     assert "Nearby context" in user_prompt
     assert "introducing a friend" in user_prompt
+    assert "ASR transcript to interpret and translate" in user_prompt
+    system_prompt = call.kwargs["json"]["messages"][0]["content"]
+    assert "everyday speech" in system_prompt
+    assert "imperfect ASR" in system_prompt
+    assert "Never invent" in system_prompt
 
 
 def test_language_heuristic():

@@ -9,15 +9,31 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lingua.audio_translate import whisper_model_path
+from lingua.config import data_models_dir
 
 
-URLS = (
-    "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/"
-    "ggml-base-q5_1.bin",
-    "https://github.com/Vaselevs/asr-models-mirror/releases/download/"
-    "models-v1/ggml-base-q8_0.bin",
-)
+MODELS = {
+    "small": (
+        "ggml-small-q5_1.bin",
+        180_000_000,
+        (
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/"
+            "ggml-small-q5_1.bin",
+            "https://github.com/Vaselevs/asr-models-mirror/releases/download/"
+            "models-v1/ggml-small-q8_0.bin",
+        ),
+    ),
+    "base": (
+        "ggml-base-q5_1.bin",
+        55_000_000,
+        (
+            "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/"
+            "ggml-base-q5_1.bin",
+            "https://github.com/Vaselevs/asr-models-mirror/releases/download/"
+            "models-v1/ggml-base-q8_0.bin",
+        ),
+    ),
+}
 
 
 def download(url: str, target: Path) -> None:
@@ -45,19 +61,21 @@ def download(url: str, target: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=tuple(MODELS), default="small")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
-    target = whisper_model_path()
-    if target.exists() and target.stat().st_size > 50 * 1024 * 1024 and not args.force:
+    filename, minimum_size, urls = MODELS[args.model]
+    target = data_models_dir() / "whisper" / filename
+    if target.exists() and target.stat().st_size >= minimum_size and not args.force:
         print(f"Model already installed: {target}")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
-    for url in URLS:
+    for url in urls:
         try:
             print(f"Downloading {url}")
             download(url, target)
-            if target.stat().st_size < 50 * 1024 * 1024:
+            if target.stat().st_size < minimum_size:
                 target.unlink(missing_ok=True)
                 raise RuntimeError("Downloaded model is unexpectedly small.")
             print(f"Installed: {target}")

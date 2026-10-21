@@ -20,7 +20,10 @@ from .languages import whisper_language
 
 
 SAMPLE_RATE = 16000
-WHISPER_MODEL_NAME = "ggml-base-q5_1.bin"
+WHISPER_MODEL_SPECS = (
+    ("small", "ggml-small-q5_1.bin", 180_000_000),
+    ("base", "ggml-base-q5_1.bin", 55_000_000),
+)
 ASR_FRAME_MS = 20
 ASR_FRAME_SAMPLES = SAMPLE_RATE * ASR_FRAME_MS // 1000
 
@@ -30,7 +33,12 @@ def normalize_transcript(text: str) -> str:
 
 
 def whisper_model_path() -> Path:
-    return data_models_dir() / "whisper" / WHISPER_MODEL_NAME
+    directory = data_models_dir() / "whisper"
+    for _, filename, minimum_size in WHISPER_MODEL_SPECS:
+        path = directory / filename
+        if path.exists() and path.stat().st_size >= minimum_size:
+            return path
+    return directory / WHISPER_MODEL_SPECS[-1][1]
 
 
 def whisper_is_available() -> bool:
@@ -38,7 +46,7 @@ def whisper_is_available() -> bool:
     return (
         importlib.util.find_spec("pywhispercpp") is not None
         and path.exists()
-        and path.stat().st_size > 55 * 1024 * 1024
+        and path.stat().st_size >= 55_000_000
     )
 
 
@@ -200,9 +208,15 @@ class SystemAudioTranscriber(QObject):
                 thread.join(timeout=2.5)
 
     def _capture_loop(self) -> None:
+        com_initialized = False
         try:
+            import pythoncom
             import soundcard as sc
 
+            # soundcard initializes COM only once at module import. Every new
+            # capture thread therefore needs its own apartment initialization.
+            pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            com_initialized = True
             speaker = sc.default_speaker()
             if speaker is None:
                 raise RuntimeError("没有找到默认扬声器。")
@@ -243,6 +257,12 @@ class SystemAudioTranscriber(QObject):
                 self._audio_queue.put_nowait(None)
             except queue.Full:
                 pass
+        finally:
+            if com_initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
 
     def _transcribe_loop(self) -> None:
         if whisper_is_available():
@@ -330,7 +350,8 @@ class SystemAudioTranscriber(QObject):
             suppress_non_speech_tokens=True,
             redirect_whispercpp_logs_to=False,
         )
-        self.device_label = "Whisper 多语言"
+        model_label = "small" if "small" in model_path.name else "base"
+        self.device_label = f"Whisper {model_label} · 多语言"
         if not self._stop_event.is_set():
             self.status_changed.emit(
                 "Whisper 多语言已就绪 · 正在聆听电脑播放的声音…"
@@ -347,6 +368,7 @@ class SystemAudioTranscriber(QObject):
                 language = ""
                 detected_language = ""
                 auto_detect = True
+        asr_prompt = ""
         segmenter = PauseSegmenter()
         while not self._stop_event.is_set():
             try:
@@ -359,11 +381,12 @@ class SystemAudioTranscriber(QObject):
                 continue
             chunk = segmenter.add_block(item)
             if chunk is not None:
-                detected_language = self._transcribe_whisper_segment(
+                detected_language, asr_prompt = self._transcribe_whisper_segment(
                     model,
                     chunk,
                     auto_detect,
                     detected_language,
+                    asr_prompt,
                 )
         final_chunk = segmenter.flush()
         if final_chunk is not None and not self._stop_event.is_set():
@@ -372,6 +395,7 @@ class SystemAudioTranscriber(QObject):
                 final_chunk,
                 auto_detect,
                 detected_language,
+                asr_prompt,
             )
 
     def _transcribe_whisper_segment(
@@ -380,12 +404,14 @@ class SystemAudioTranscriber(QObject):
         chunk: np.ndarray,
         auto_detect: bool,
         detected_language: str,
-    ) -> str:
+        asr_prompt: str,
+    ) -> tuple[str, str]:
         rms = float(np.sqrt(np.mean(np.square(chunk))))
         if rms < 0.00035:
-            return detected_language
+            return detected_language, asr_prompt
         peak = float(np.max(np.abs(chunk)))
         chunk = np.clip(chunk / max(peak, 0.04) * 0.78, -1.0, 1.0)
+        previous_language = detected_language
         if auto_detect:
             detection = model.auto_detect_language(chunk.astype(np.float32))
             new_language, probability = detection[0]
@@ -394,21 +420,29 @@ class SystemAudioTranscriber(QObject):
             ):
                 detected_language = new_language
             if not detected_language:
-                return ""
+                return "", asr_prompt
+        if previous_language and previous_language != detected_language:
+            asr_prompt = ""
+        transcribe_options = {
+            "language": detected_language,
+            "detect_language": False,
+            "no_context": False,
+            "no_timestamps": False,
+            "print_progress": False,
+            "print_realtime": False,
+            "print_timestamps": False,
+            "suppress_blank": True,
+            "suppress_non_speech_tokens": True,
+            "no_speech_thold": 0.68,
+            "logprob_thold": -1.5,
+            "temperature": 0.0,
+            "greedy": {"best_of": 3},
+        }
+        if asr_prompt:
+            transcribe_options["initial_prompt"] = asr_prompt
         segments = model.transcribe(
             chunk.astype(np.float32),
-            language=detected_language,
-            detect_language=False,
-            no_timestamps=False,
-            print_progress=False,
-            print_realtime=False,
-            print_timestamps=False,
-            suppress_blank=True,
-            suppress_non_speech_tokens=True,
-            no_speech_thold=0.62,
-            logprob_thold=-1.1,
-            temperature=0.0,
-            greedy={"best_of": 1},
+            **transcribe_options,
         )
         text = " ".join(
             segment.text.strip()
@@ -416,7 +450,9 @@ class SystemAudioTranscriber(QObject):
             if segment.text and segment.text.strip()
         )
         self._emit_text(text, detected_language)
-        return detected_language
+        if text:
+            asr_prompt = (asr_prompt + " " + text).strip()[-220:]
+        return detected_language, asr_prompt
 
     def _emit_text(self, text: str, language_code: str | None = None) -> None:
         text = re.sub(r"\s+", " ", text).strip()

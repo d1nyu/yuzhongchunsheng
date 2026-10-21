@@ -141,6 +141,8 @@ DeepSeek 密钥使用 Windows DPAPI 加密后保存在：
 python scripts/install_whisper_model.py
 ```
 
+默认安装准确率更高的 `small` 模型；需要更快的低配版本时可运行 `--model base`。
+
 模型默认安装到：
 
 ```text

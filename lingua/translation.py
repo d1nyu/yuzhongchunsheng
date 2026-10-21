@@ -57,6 +57,7 @@ class TranslationService:
         source: str,
         target: str,
         context: str = "",
+        style: str = "natural",
     ) -> TranslationResult:
         text = text.strip()
         if not text:
@@ -69,9 +70,13 @@ class TranslationService:
             return TranslationResult(text, "无需翻译", source)
 
         if self.engine == "deepseek":
-            return self._chat_translate(text, source, target, "deepseek", context)
+            return self._chat_translate(
+                text, source, target, "deepseek", context, style
+            )
         if self.engine == "openai":
-            return self._chat_translate(text, source, target, "openai", context)
+            return self._chat_translate(
+                text, source, target, "openai", context, style
+            )
         if self.engine == "mymemory":
             return self._mymemory_with_fallback(text, source, target)
         return self._google_with_fallback(text, source, target)
@@ -186,6 +191,7 @@ class TranslationService:
         target: str,
         provider: str,
         context: str = "",
+        style: str = "natural",
     ) -> TranslationResult:
         if provider == "deepseek":
             api_key = reveal_secret(str(self.settings.get("deepseek_api_key", "")))
@@ -211,13 +217,34 @@ class TranslationService:
             else f"{get_language(source).label} ({source})"
         )
         target_name = f"{get_language(target).label} ({target})"
+        if style == "spoken":
+            style_prompt = (
+                "You are a native-level dialogue translator and subtitle localizer. "
+                "The current utterance comes from imperfect ASR of casual or "
+                "non-native speech. It may contain pronunciation-induced substitution "
+                "errors, homophones, repetitions, filler words and missing punctuation. "
+                "Use nearby context to reconstruct the most likely intended meaning, "
+                "but correct only errors that are strongly supported. Never invent "
+                "facts, names, numbers, negation, modality or intent; when uncertain, "
+                "stay closer to the literal available wording. After understanding it, "
+                "translate into natural, idiomatic everyday speech that a native speaker "
+                "would actually say. Preserve humor, emotion, slang and sentence "
+                "fragments without exaggerating them. Avoid formal written phrasing, "
+                "literal word-for-word wording and translationese. Do not make the "
+                "speaker sound more educated, polite or formal than the original."
+            )
+        else:
+            style_prompt = (
+                "You are a native-level translator. Translate the current text "
+                "into clear, idiomatic language while preserving the original "
+                "register, tone, names and formatting. Avoid literal wording and "
+                "translationese."
+            )
         system_prompt = (
-            "You are a precise professional translation engine. "
-            "Translate the user's text into the requested target language. "
-            "Preserve meaning, tone, names, formatting and line breaks. "
+            f"{style_prompt} "
             "Use the supplied nearby context only to resolve pronouns, terminology "
             "and implied meaning. Do not translate or repeat the context. "
-            "Do not summarize, answer, explain, or add notes or quotation marks. "
+            "Do not summarize, answer, explain, sanitize, or add notes. "
             "Return only the translated text."
         )
         context_block = ""
@@ -230,7 +257,7 @@ class TranslationService:
             f"Source language: {source_name}\n"
             f"Target language: {target_name}\n\n"
             f"{context_block}"
-            f"Text to translate:\n{text}"
+            f"{'ASR transcript to interpret and translate' if style == 'spoken' else 'Text to translate'}:\n{text}"
         )
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -238,7 +265,7 @@ class TranslationService:
         }
         body = {
             "model": model,
-            "temperature": 0.15,
+            "temperature": 0.2 if style == "spoken" else 0.12,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

@@ -162,7 +162,7 @@ class PauseSegmenter:
 
 
 class SystemAudioTranscriber(QObject):
-    transcript_ready = pyqtSignal(str, str, str, str)
+    transcript_ready = pyqtSignal(str, str, str, str, float, float)
     status_changed = pyqtSignal(str)
     level_changed = pyqtSignal(float)
     error = pyqtSignal(str)
@@ -291,6 +291,8 @@ class SystemAudioTranscriber(QObject):
 
     def _vosk_loop(self) -> None:
         recognizer = None
+        session_samples = 0
+        utterance_start_samples: int | None = None
         try:
             import vosk
 
@@ -316,17 +318,28 @@ class SystemAudioTranscriber(QObject):
                     break
                 if item.size == 0:
                     continue
+                session_samples += item.size
                 rms = float(np.sqrt(np.mean(np.square(item))))
                 if rms < 0.0003:
                     pcm = np.zeros(item.size, dtype=np.int16).tobytes()
                 else:
+                    if utterance_start_samples is None:
+                        utterance_start_samples = session_samples - item.size
                     peak = float(np.max(np.abs(item)))
                     scaled = item / max(peak, 0.04) * 0.72
                     pcm = (np.clip(scaled, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
                 if recognizer.AcceptWaveform(pcm):
                     result = json.loads(recognizer.Result())
                     text = str(result.get("text", "")).strip()
-                    self._emit_text(text)
+                    start_seconds = (
+                        utterance_start_samples or session_samples - item.size
+                    ) / SAMPLE_RATE
+                    self._emit_text(
+                        text,
+                        start_seconds=start_seconds,
+                        end_seconds=session_samples / SAMPLE_RATE,
+                    )
+                    utterance_start_samples = None
         except Exception as exc:
             if not self._stop_event.is_set():
                 self.error.emit(f"本地语音转写失败：{exc}")
@@ -335,7 +348,13 @@ class SystemAudioTranscriber(QObject):
             if recognizer is not None:
                 try:
                     result = json.loads(recognizer.FinalResult())
-                    self._emit_text(str(result.get("text", "")).strip())
+                    self._emit_text(
+                        str(result.get("text", "")).strip(),
+                        start_seconds=(
+                            utterance_start_samples or session_samples
+                        ) / SAMPLE_RATE,
+                        end_seconds=session_samples / SAMPLE_RATE,
+                    )
                 except Exception:
                     pass
 
@@ -396,6 +415,7 @@ class SystemAudioTranscriber(QObject):
         default_language = detected_language
         asr_states: dict[str, tuple[str, str]] = {}
         segmenter = PauseSegmenter()
+        timeline_seconds = 0.0
         while not self._stop_event.is_set():
             try:
                 item = self._audio_queue.get(timeout=0.3)
@@ -405,8 +425,13 @@ class SystemAudioTranscriber(QObject):
                 break
             if item.size == 0:
                 continue
+            timeline_seconds += item.size / SAMPLE_RATE
             chunk = segmenter.add_block(item)
             if chunk is not None:
+                chunk_start = max(
+                    0.0,
+                    timeline_seconds - chunk.size / SAMPLE_RATE,
+                )
                 content_warning = ""
                 if content_gate is not None:
                     content = content_gate.classify(chunk)
@@ -452,10 +477,16 @@ class SystemAudioTranscriber(QObject):
                         speaker_prompt,
                         speaker,
                         warning,
+                        chunk_start + speaker_chunk.start,
+                        chunk_start + speaker_chunk.end,
                     )
                     asr_states[speaker] = (detected_language, prompt)
         final_chunk = segmenter.flush()
         if final_chunk is not None and not self._stop_event.is_set():
+            chunk_start = max(
+                0.0,
+                timeline_seconds - final_chunk.size / SAMPLE_RATE,
+            )
             content_warning = ""
             if content_gate is not None:
                 content = content_gate.classify(final_chunk)
@@ -501,6 +532,8 @@ class SystemAudioTranscriber(QObject):
                     speaker_prompt,
                     speaker,
                     warning,
+                    chunk_start + speaker_chunk.start,
+                    chunk_start + speaker_chunk.end,
                 )
                 asr_states[speaker] = (detected_language, prompt)
 
@@ -513,6 +546,8 @@ class SystemAudioTranscriber(QObject):
         asr_prompt: str,
         speaker: str = "",
         content_warning: str = "",
+        start_seconds: float = 0.0,
+        end_seconds: float = 0.0,
     ) -> tuple[str, str]:
         rms = float(np.sqrt(np.mean(np.square(chunk))))
         if rms < 0.00035:
@@ -557,7 +592,14 @@ class SystemAudioTranscriber(QObject):
             for segment in segments
             if segment.text and segment.text.strip()
         )
-        self._emit_text(text, detected_language, speaker, content_warning)
+        self._emit_text(
+            text,
+            detected_language,
+            speaker,
+            content_warning,
+            start_seconds,
+            end_seconds,
+        )
         if text:
             asr_prompt = (asr_prompt + " " + text).strip()[-220:]
         return detected_language, asr_prompt
@@ -568,6 +610,8 @@ class SystemAudioTranscriber(QObject):
         language_code: str | None = None,
         speaker: str = "",
         content_warning: str = "",
+        start_seconds: float = 0.0,
+        end_seconds: float = 0.0,
     ) -> None:
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
@@ -599,5 +643,7 @@ class SystemAudioTranscriber(QObject):
             language_code or self.language,
             speaker,
             content_warning,
+            start_seconds,
+            end_seconds,
         )
 

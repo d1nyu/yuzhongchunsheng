@@ -4,31 +4,40 @@ from __future__ import annotations
 
 import re
 import importlib.util
+import time
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any
 
-from PyQt5.QtCore import QByteArray, QRect, QTimer, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QByteArray, QPoint, QRect, QTimer, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QKeySequence, QPixmap, QTextCursor
 from PyQt5.QtWidgets import (
+    QAction,
     QApplication,
     QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QPushButton,
     QShortcut,
     QStackedWidget,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from . import theme
+from .branding import make_brand_icon
 from .audio_translate import SystemAudioTranscriber, whisper_is_available
 from .config import ENGINE_LABELS, load_settings, save_settings
+from .floating_launcher import FloatingLauncher, QuickActionPanel
 from .hotkeys import GlobalHotkeyFilter
+from .insights_dialog import VideoAssistantDialog
 from .languages import (
     SOURCE_LANGUAGES,
     TARGET_LANGUAGES,
@@ -41,6 +50,8 @@ from .languages import (
 )
 from .ocr import SubtitleOcrWorker
 from .overlay import QuickTranslationPopup, RegionSelector, SubtitleOverlay
+from .player_bridge import PlaybackState, PlayerBridge
+from .player_sync_dialog import PlayerSyncDialog
 from .secrets import reveal_secret
 from .settings_dialog import SettingsDialog
 from .speech import (
@@ -50,6 +61,13 @@ from .speech import (
     list_sapi_voices,
 )
 from .translation import TranslationResult, TranslationService
+from .video_insights import (
+    InsightRecord,
+    InsightResult,
+    VideoInsightsService,
+    format_timestamp,
+    record_from_entry,
+)
 from .widgets import (
     Card,
     LineIconButton,
@@ -101,6 +119,45 @@ class TranslateWorker(QThread):
             self.error_ready.emit(self.request_id, self.context, str(exc))
 
 
+class VideoInsightWorker(QThread):
+    result_ready = pyqtSignal(int, object, str)
+    error_ready = pyqtSignal(int, str)
+
+    def __init__(
+        self,
+        request_id: int,
+        settings: dict[str, Any],
+        records: list[InsightRecord],
+        target_label: str,
+        question: str,
+        focus_seconds: int,
+        conversation: list[dict[str, str]],
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.request_id = request_id
+        self.settings = dict(settings)
+        self.records = records
+        self.target_label = target_label
+        self.question = question
+        self.focus_seconds = focus_seconds
+        self.conversation = [dict(turn) for turn in conversation]
+
+    def run(self) -> None:
+        try:
+            service = VideoInsightsService(self.settings)
+            result = service.analyze(
+                self.records,
+                self.target_label,
+                self.question,
+                self.focus_seconds,
+                self.conversation,
+            )
+            self.result_ready.emit(self.request_id, result, self.question)
+        except Exception as exc:
+            self.error_ready.emit(self.request_id, str(exc))
+
+
 class MainWindow(QMainWindow):
     MAX_CHARS = 5000
 
@@ -145,6 +202,7 @@ class MainWindow(QMainWindow):
         self._video_legacy_requests: set[int] = set()
         self._video_translation_queue: list[int] = []
         self._video_speakers: set[str] = set()
+        self._video_session_started_at = time.monotonic()
         self._audio_detected_language = ""
         self._audio_transcriber: SystemAudioTranscriber | None = None
         self._text_ocr_worker: SubtitleOcrWorker | None = None
@@ -155,8 +213,21 @@ class MainWindow(QMainWindow):
         self._quick_source_text = ""
         self._quick_seq = 0
         self._hotkey_filter: GlobalHotkeyFilter | None = None
+        self._floating_launcher: FloatingLauncher | None = None
+        self._quick_action_panel: QuickActionPanel | None = None
+        self._last_floating_position: QPoint | None = None
+        self._tray_icon: QSystemTrayIcon | None = None
+        self._tray_menu: QMenu | None = None
+        self._player_bridge = PlayerBridge(self)
+        self._player_sync_dialog: PlayerSyncDialog | None = None
+        self._quitting = False
+        self._background_hint_shown = False
+        self._insight_dialog: VideoAssistantDialog | None = None
+        self._insight_worker: VideoInsightWorker | None = None
+        self._insight_seq = 0
+        self._insight_conversation: list[dict[str, str]] = []
 
-        self.setWindowTitle("羽中纯声 · 文字 / 语音 / 视频翻译")
+        self.setWindowTitle("羽中纯声 · 文字 / 语音 / 视频理解")
         self.setMinimumSize(1020, 720)
         self.resize(1180, 820)
         self.auto_timer = QTimer(self)
@@ -173,6 +244,9 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._bind_shortcuts()
         self._restore_state()
+        self._setup_floating_launcher()
+        self._setup_player_bridge()
+        self._setup_tray_icon()
         self._setup_global_hotkey()
 
     def _build_ui(self) -> None:
@@ -203,7 +277,7 @@ class MainWindow(QMainWindow):
         titles.setSpacing(0)
         name = QLabel("羽中纯声")
         name.setObjectName("AppName")
-        tagline = QLabel("羽落成声 · 文字 · 语音 · 视频翻译")
+        tagline = QLabel("羽落成声 · 翻译 · 理解 · 视频辅助")
         tagline.setObjectName("AppTagline")
         titles.addWidget(name)
         titles.addWidget(tagline)
@@ -223,7 +297,7 @@ class MainWindow(QMainWindow):
     def _build_mode_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(10)
-        self.mode_control = SegmentedControl(["文字翻译", "语音翻译", "视频翻译"])
+        self.mode_control = SegmentedControl(["文字翻译", "语音翻译", "视频辅助"])
         self.mode_control.currentChanged.connect(self._mode_changed)
         row.addWidget(self.mode_control)
         row.addStretch()
@@ -233,8 +307,14 @@ class MainWindow(QMainWindow):
         self.auto_speak_check = QCheckBox("自动朗读")
         self.auto_speak_check.setToolTip("翻译完成后自动朗读译文")
         self.auto_speak_check.toggled.connect(self._behavior_changed)
+        self.floating_check = QCheckBox("漂浮按钮")
+        self.floating_check.setToolTip("在桌面上显示快捷功能按钮")
+        self.floating_check.toggled.connect(
+            self._floating_button_enabled_changed
+        )
         row.addWidget(self.auto_translate_check)
         row.addWidget(self.auto_speak_check)
+        row.addWidget(self.floating_check)
         return row
 
     def _build_language_card(self) -> Card:
@@ -539,7 +619,7 @@ class MainWindow(QMainWindow):
 
         info_column = QVBoxLayout()
         info_column.setSpacing(5)
-        self.video_headline = QLabel("框选字幕区域，实时看懂视频")
+        self.video_headline = QLabel("框选字幕区域，实时翻译并总结视频")
         self.video_headline.setStyleSheet(
             "font-size:20px;font-weight:600;color:#3A2226;"
         )
@@ -592,6 +672,17 @@ class MainWindow(QMainWindow):
         self.video_engine_pill = QLabel("Vosk · 本地 · 英语")
         self.video_engine_pill.setObjectName("SpeechEnginePill")
         video_options.addWidget(self.video_engine_pill)
+        self.player_sync_label = QLabel("时间同步 · 未连接")
+        self.player_sync_label.setObjectName("SpeechEnginePill")
+        self.player_sync_label.setToolTip(
+            "连接浏览器扩展后使用视频真实时间，并可点击时间跳转"
+        )
+        video_options.addWidget(self.player_sync_label)
+        self.player_sync_button = QPushButton("连接")
+        self.player_sync_button.setObjectName("SecondaryButton")
+        self.player_sync_button.setFixedHeight(26)
+        self.player_sync_button.clicked.connect(self._open_player_sync_help)
+        video_options.addWidget(self.player_sync_button)
         video_options.addStretch()
         info_column.addLayout(video_options)
         stage_layout.addLayout(info_column, 1)
@@ -681,6 +772,14 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.video_status_dot)
         action_row.addWidget(self.video_status)
         action_row.addStretch()
+        self.video_assistant_button = QPushButton("AI 总结")
+        self.video_assistant_button.setObjectName("SecondaryButton")
+        self.video_assistant_button.setToolTip(
+            "总结本次播放，并继续提问或查找发言时间"
+        )
+        self.video_assistant_button.setEnabled(False)
+        self.video_assistant_button.clicked.connect(self._open_video_insights)
+        action_row.addWidget(self.video_assistant_button)
         self.video_translate_button = QPushButton("重新翻译最新一条")
         self.video_translate_button.setObjectName("SecondaryButton")
         self.video_translate_button.setEnabled(False)
@@ -726,6 +825,362 @@ class MainWindow(QMainWindow):
                 4200,
             )
 
+    def _setup_floating_launcher(self) -> None:
+        launcher = FloatingLauncher()
+        panel = QuickActionPanel()
+        launcher.clicked.connect(self._toggle_floating_panel)
+        launcher.double_clicked.connect(self._show_main_window)
+        launcher.position_changed.connect(self._floating_position_changed)
+        panel.action_requested.connect(self._handle_floating_action)
+        self._floating_launcher = launcher
+        self._quick_action_panel = panel
+
+        raw_pos = self.settings.get("floating_button_pos", [])
+        if isinstance(raw_pos, list) and len(raw_pos) == 2:
+            try:
+                launcher.move(int(raw_pos[0]), int(raw_pos[1]))
+            except (TypeError, ValueError):
+                launcher.place_default()
+        else:
+            launcher.place_default()
+        launcher.clamp_to_screen()
+        self._last_floating_position = launcher.pos()
+        if self.floating_check.isChecked():
+            launcher.show()
+        self._sync_floating_launcher()
+
+    def _floating_button_enabled_changed(self, enabled: bool) -> None:
+        self.settings["floating_button_enabled"] = enabled
+        self._save_settings_quietly()
+        launcher = self._floating_launcher
+        if launcher is None:
+            return
+        if enabled:
+            launcher.show()
+            launcher.clamp_to_screen()
+            launcher.raise_()
+            self._sync_floating_launcher()
+        else:
+            if self._quick_action_panel is not None:
+                self._quick_action_panel.hide()
+            launcher.hide()
+
+    def _floating_position_changed(self, position: QPoint) -> None:
+        self._last_floating_position = QPoint(position)
+        self.settings["floating_button_pos"] = [position.x(), position.y()]
+        self._save_settings_quietly()
+
+    def _toggle_floating_panel(self) -> None:
+        launcher = self._floating_launcher
+        panel = self._quick_action_panel
+        if launcher is None or panel is None:
+            return
+        if panel.isVisible():
+            panel.hide()
+            return
+        self._sync_floating_launcher()
+        panel.show_near(launcher)
+
+    def _sync_floating_launcher(self) -> None:
+        launcher = self._floating_launcher
+        if launcher is None:
+            return
+        speech_active = bool(
+            self._speech_worker is not None
+            and self._speech_worker.isRunning()
+        )
+        launcher.set_active(self._video_monitoring or speech_active)
+        if self._quick_action_panel is not None:
+            self._quick_action_panel.set_state(
+                self._video_monitoring,
+                self._video_source_mode(),
+                self._video_region is not None,
+                bool(self._video_entries),
+            )
+
+    def _show_main_window(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _open_mode_from_floating(self, index: int) -> None:
+        self._show_main_window()
+        self.mode_control.setCurrentIndex(index)
+        self._mode_changed(index)
+
+    def _set_video_source_from_floating(self, mode: str) -> None:
+        if self._video_monitoring and self._video_source_mode() != mode:
+            self._stop_video_monitoring()
+        index = self.video_source_combo.findData(mode)
+        self.video_source_combo.blockSignals(True)
+        self.video_source_combo.setCurrentIndex(max(0, index))
+        self.video_source_combo.blockSignals(False)
+        self.settings["audio_source_mode"] = mode
+        self._save_settings_quietly()
+        self._update_video_mode_ui()
+
+    def _enter_video_mode_from_floating(self) -> None:
+        self.mode_control.setCurrentIndex(2)
+        self._mode_changed(2)
+
+    def _handle_floating_action(self, action: str) -> None:
+        if action == "open":
+            self._show_main_window()
+        elif action == "text":
+            self._open_mode_from_floating(0)
+        elif action == "voice":
+            self._open_mode_from_floating(1)
+        elif action == "video":
+            self._open_mode_from_floating(2)
+        elif action == "sync":
+            self._open_player_sync_help()
+        elif action == "quick":
+            self._start_text_selection()
+        elif action == "audio":
+            was_audio = (
+                self._video_monitoring
+                and self._video_source_mode() == "audio"
+            )
+            self._enter_video_mode_from_floating()
+            self._set_video_source_from_floating("audio")
+            if was_audio:
+                self._stop_video_monitoring()
+            else:
+                self._start_audio_monitoring()
+        elif action == "subtitle":
+            was_subtitle = (
+                self._video_monitoring
+                and self._video_source_mode() == "subtitle"
+            )
+            self._enter_video_mode_from_floating()
+            self._set_video_source_from_floating("subtitle")
+            if was_subtitle:
+                self._stop_video_monitoring()
+            elif self._video_region is None:
+                self._select_video_region()
+            else:
+                self._start_video_monitoring()
+        elif action == "summary":
+            if self._video_entries:
+                self._open_video_insights()
+            else:
+                self._open_mode_from_floating(2)
+                self.toast.show_message(
+                    "先识别一段视频内容，再生成总结。",
+                    "info",
+                    3000,
+                )
+        elif action == "hide":
+            self.floating_check.setChecked(False)
+        elif action == "quit":
+            self._quit_application()
+        self._sync_floating_launcher()
+
+    def _setup_player_bridge(self) -> None:
+        self._player_bridge.state_changed.connect(self._player_state_changed)
+        self._player_bridge.connection_changed.connect(
+            self._player_connection_changed
+        )
+        self._player_bridge.error.connect(self._player_bridge_error)
+        if not self._player_bridge.start():
+            self.player_sync_label.setText("时间同步 · 不可用")
+
+    def _player_state_changed(self, state: PlaybackState) -> None:
+        title = state.title.strip() or "网页视频"
+        if state.manual:
+            text = "时间同步 · 手动校准"
+        else:
+            text = f"时间同步 · {title[:18]}"
+        self.player_sync_label.setText(text)
+        self.player_sync_label.setToolTip(
+            f"{title}\n"
+            f"当前时间：{format_timestamp(state.current_time)}\n"
+            f"本地桥接端口：{self._player_bridge.port}"
+        )
+        self.player_sync_label.setStyleSheet(
+            "background:#E9F7F0;color:#247A59;"
+            "border:1px solid #D2EBDD;border-radius:10px;"
+            "padding:3px 9px;font-size:10px;"
+        )
+        if self._player_sync_dialog is not None:
+            self._player_sync_dialog.set_connection(
+                True,
+                title,
+                state.manual,
+            )
+
+    def _player_connection_changed(self, connected: bool) -> None:
+        if connected:
+            state = self._player_bridge.state
+            if state is not None:
+                self._player_state_changed(state)
+            return
+        self.player_sync_label.setText("时间同步 · 未连接")
+        self.player_sync_label.setStyleSheet("")
+        self.player_sync_label.setToolTip(
+            "连接浏览器扩展后使用视频真实时间"
+        )
+        if self._player_sync_dialog is not None:
+            self._player_sync_dialog.set_connection(False)
+
+    def _player_bridge_error(self, message: str) -> None:
+        self.player_sync_label.setText("时间同步 · 不可用")
+        self.player_sync_label.setToolTip(message)
+
+    def _open_player_sync_help(self) -> None:
+        if self._player_sync_dialog is None:
+            extension_dir = (
+                Path(__file__).resolve().parent.parent / "browser_extension"
+            )
+            dialog = PlayerSyncDialog(
+                extension_dir,
+                self._player_bridge.port or 8765,
+                self,
+            )
+            dialog.manual_sync_requested.connect(
+                self._manual_player_sync
+            )
+            self._player_sync_dialog = dialog
+        state = self._player_bridge.state
+        self._player_sync_dialog.set_connection(
+            self._player_bridge.is_connected,
+            state.title if state is not None else "",
+            bool(state and state.manual),
+        )
+        self._player_sync_dialog.show()
+        self._player_sync_dialog.raise_()
+        self._player_sync_dialog.activateWindow()
+
+    def _manual_player_sync(self) -> None:
+        state = self._player_bridge.state
+        default = (
+            format_timestamp(state.current_time)
+            if state is not None
+            else "00:00:00"
+        )
+        text, accepted = QInputDialog.getText(
+            self._player_sync_dialog or self,
+            "手动同步播放器时间",
+            "输入播放器当前时间（时:分:秒 或 分:秒）：",
+            text=default,
+        )
+        if not accepted:
+            return
+        seconds = self._parse_clock_time(text)
+        if seconds is None:
+            self.toast.show_message(
+                "时间格式无效，请输入如 01:23:45 或 12:30。",
+                "error",
+                3600,
+            )
+            return
+        if self._player_bridge.set_manual_position(seconds):
+            self.toast.show_message(
+                "已手动同步播放器时间。连接浏览器扩展后可点击跳转。",
+                "success",
+                4200,
+            )
+
+    @staticmethod
+    def _parse_clock_time(value: str) -> float | None:
+        parts = value.strip().replace("：", ":").split(":")
+        if not 1 <= len(parts) <= 3:
+            return None
+        try:
+            numbers = [int(part.strip()) for part in parts]
+        except ValueError:
+            return None
+        if any(number < 0 for number in numbers):
+            return None
+        if len(numbers) == 1:
+            return float(numbers[0])
+        if len(numbers) == 2:
+            minutes, seconds = numbers
+            if seconds >= 60:
+                return None
+            return float(minutes * 60 + seconds)
+        hours, minutes, seconds = numbers
+        if minutes >= 60 or seconds >= 60:
+            return None
+        return float(hours * 3600 + minutes * 60 + seconds)
+
+    def _player_time_for_relative(self, relative_seconds: float) -> float | None:
+        if not self._player_bridge.is_connected:
+            return None
+        return self._player_bridge.time_at(
+            self._video_session_started_at + max(0.0, relative_seconds)
+        )
+
+    def _seek_player_time(self, seconds: float) -> None:
+        if not self._player_bridge.seek(seconds):
+            self.toast.show_message(
+                "当前播放器只能记录时间，无法自动跳转。"
+                "请安装并启用浏览器时间同步扩展。",
+                "info",
+                4400,
+            )
+            return
+        candidates = [
+            item
+            for item in self._video_entries
+            if item.get("player_time_seconds") is not None
+        ]
+        entry = min(
+            candidates,
+            key=lambda item: abs(
+                float(item.get("player_time_seconds", 0.0)) - seconds
+            ),
+            default=None,
+        )
+        if entry is not None:
+            self._focus_video_entry(entry)
+        self.toast.show_message(
+            f"已请求播放器跳转到 {format_timestamp(seconds)}",
+            "success",
+            2600,
+        )
+
+    def _setup_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        tray = QSystemTrayIcon(make_brand_icon(64), self)
+        tray.setToolTip("羽中纯声 · 后台运行")
+        menu = QMenu()
+        open_action = QAction("打开主窗口", menu)
+        open_action.triggered.connect(self._show_main_window)
+        menu.addAction(open_action)
+        quick_action = QAction("选区翻译", menu)
+        quick_action.triggered.connect(self._start_text_selection)
+        menu.addAction(quick_action)
+        menu.addSeparator()
+        quit_action = QAction("彻底退出羽中纯声", menu)
+        quit_action.triggered.connect(self._quit_application)
+        menu.addAction(quit_action)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._tray_activated)
+        tray.show()
+        self._tray_icon = tray
+        self._tray_menu = menu
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.Trigger,
+            QSystemTrayIcon.DoubleClick,
+        ):
+            self._show_main_window()
+
+    def _quit_application(self) -> None:
+        self._quitting = True
+        if self._quick_action_panel is not None:
+            self._quick_action_panel.hide()
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+        self.close()
+        QApplication.quit()
+
     def _restore_state(self) -> None:
         geometry = str(self.settings.get("geometry", ""))
         if geometry:
@@ -747,6 +1202,11 @@ class MainWindow(QMainWindow):
         self.auto_speak_check.setChecked(bool(self.settings.get("auto_speak", True)))
         self.auto_translate_check.blockSignals(False)
         self.auto_speak_check.blockSignals(False)
+        self.floating_check.blockSignals(True)
+        self.floating_check.setChecked(
+            bool(self.settings.get("floating_button_enabled", True))
+        )
+        self.floating_check.blockSignals(False)
 
         self.source_combo.currentIndexChanged.connect(self._language_changed)
         self.target_combo.currentIndexChanged.connect(self._language_changed)
@@ -820,6 +1280,7 @@ class MainWindow(QMainWindow):
             )
             self.auto_translate_check.setToolTip("视频字幕模式会自动翻译新增字幕")
         self._save_settings_quietly()
+        self._sync_floating_launcher()
 
     def _language_changed(self) -> None:
         source = self._source_code()
@@ -921,14 +1382,15 @@ class MainWindow(QMainWindow):
         self.settings["audio_source_mode"] = mode
         self._save_settings_quietly()
         self._update_video_mode_ui()
+        self._sync_floating_launcher()
 
     def _update_video_mode_ui(self) -> None:
         mode = self._video_source_mode()
         if mode == "audio":
-            self.video_headline.setText("用电脑声音实时翻译视频")
+            self.video_headline.setText("用电脑声音实时翻译并理解视频")
             self.video_hint.setText(
                 "无需字幕。自动识别语言和说话人；多人会默认全部显示，"
-                "纯音乐与歌词片段会自动跳过。"
+                "纯音乐与歌词片段会自动跳过，停止后可生成视频总结。"
             )
             self.video_region_label.setText(
                 "声音来源：默认扬声器回环 · 不占用麦克风"
@@ -937,7 +1399,7 @@ class MainWindow(QMainWindow):
             self.video_start_button.setEnabled(True)
             self.video_preview.setPixmap(QPixmap())
             self.video_preview.setText(
-                "电脑声音\n\nWhisper 多语言转写\nDeepSeek 翻译"
+                "电脑声音\n\nWhisper 多语言转写\nDeepSeek 翻译与理解"
             )
             engine = "Whisper · 本地 · 多语言" if whisper_is_available() else "Vosk · 本地 · 英语"
             self.video_engine_pill.setText(engine)
@@ -948,9 +1410,10 @@ class MainWindow(QMainWindow):
             self.video_result_edit.setPlaceholderText("所有说话人的译文会对应显示在这里")
             self._set_video_status("ready", "点击“开始识别”监听视频声音")
         else:
-            self.video_headline.setText("框选字幕区域，实时看懂视频")
+            self.video_headline.setText("框选字幕区域，实时翻译并总结视频")
             self.video_hint.setText(
-                "框选画面中的字幕条，程序会持续识别新增字幕并自动翻译。"
+                "框选画面中的字幕条，程序会持续识别、翻译；"
+                "停止后可以总结本次内容并继续追问。"
             )
             self.video_select_button.setVisible(True)
             self.video_engine_pill.setText("本地 OCR · 中英文")
@@ -965,11 +1428,15 @@ class MainWindow(QMainWindow):
             else:
                 self.video_preview.setPixmap(QPixmap())
                 self.video_preview.setText("尚未选择区域")
-                self._set_video_status("ready", "先框选视频里的字幕区域")
+                self._set_video_status(
+                    "ready",
+                    "先框选视频里的字幕区域",
+                )
 
     def _select_video_region(self) -> None:
         if self._video_monitoring:
             self._stop_video_monitoring()
+        self._hide_floating_launcher_for_selection()
         selector = RegionSelector()
         self._region_selector = selector
         selector.region_selected.connect(self._video_region_selected)
@@ -981,6 +1448,7 @@ class MainWindow(QMainWindow):
 
     def _video_region_selection_cancelled(self) -> None:
         self._region_selector = None
+        self._restore_floating_launcher_after_selection()
 
     def _start_text_selection(self) -> None:
         if QApplication.activeModalWidget() is not None:
@@ -998,6 +1466,7 @@ class MainWindow(QMainWindow):
             self._stop_listening()
         if self._quick_popup is not None:
             self._quick_popup.hide()
+        self._hide_floating_launcher_for_selection()
         selector = RegionSelector(
             "拖动框选屏幕上的文字  ·  按 Esc 取消",
             min_width=12,
@@ -1013,9 +1482,14 @@ class MainWindow(QMainWindow):
 
     def _text_region_cancelled(self) -> None:
         self._text_region_selector = None
+        self._restore_floating_launcher_after_selection()
 
     def _text_region_selected(self, region: QRect) -> None:
         self._text_region_selector = None
+        QTimer.singleShot(
+            350,
+            self._restore_floating_launcher_after_selection,
+        )
         QTimer.singleShot(100, lambda: self._capture_text_region(region))
 
     def _capture_text_region(self, region: QRect) -> None:
@@ -1097,6 +1571,7 @@ class MainWindow(QMainWindow):
 
     def _video_region_selected(self, region: QRect) -> None:
         self._region_selector = None
+        self._restore_floating_launcher_after_selection()
         if region.width() < 80 or region.height() < 22:
             self.toast.show_message("选择区域太小，请重新框选字幕条。", "info")
             return
@@ -1112,6 +1587,18 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(120, self._refresh_video_preview)
         self.toast.show_message("字幕区域已选好，正在开始识别。")
         QTimer.singleShot(220, self._start_video_monitoring)
+
+    def _hide_floating_launcher_for_selection(self) -> None:
+        if self._floating_launcher is not None:
+            self._floating_launcher.hide()
+
+    def _restore_floating_launcher_after_selection(self) -> None:
+        if (
+            self._floating_launcher is not None
+            and self.floating_check.isChecked()
+        ):
+            self._floating_launcher.show()
+            self._floating_launcher.raise_()
 
     def _update_video_region_ui(self) -> None:
         region = self._video_region
@@ -1165,7 +1652,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_video_monitoring(self) -> None:
         if self._video_monitoring:
-            self._stop_video_monitoring()
+            self._stop_video_monitoring(open_summary=True)
         elif self._video_source_mode() == "audio":
             self._start_audio_monitoring()
         else:
@@ -1186,6 +1673,7 @@ class MainWindow(QMainWindow):
             self._ocr_worker = worker
             worker.start()
         self._video_monitoring = True
+        self._sync_floating_launcher()
         self._last_video_ocr_key = ""
         self._last_video_ocr_speaker = ""
         self._last_video_translated_source = ""
@@ -1233,6 +1721,7 @@ class MainWindow(QMainWindow):
         transcriber.error.connect(self._audio_error)
         self._audio_transcriber = transcriber
         self._video_monitoring = True
+        self._sync_floating_launcher()
         self._last_video_ocr_key = ""
         self._last_video_ocr_speaker = ""
         self._last_video_translated_source = ""
@@ -1242,7 +1731,8 @@ class MainWindow(QMainWindow):
         self.video_start_button.setText("停止识别")
         self.video_headline.setText("正在监听电脑声音")
         self.video_hint.setText(
-            "请正常播放视频声音；程序会自动分人、跳过纯音乐，并逐条翻译。"
+            "请正常播放视频声音；程序会自动分人、跳过纯音乐并逐条翻译，"
+            "停止后生成观看总结。"
         )
         self.video_engine_pill.setText(
             "Whisper · 正在启动" if whisper_is_available() else "Vosk · 正在启动"
@@ -1271,8 +1761,18 @@ class MainWindow(QMainWindow):
         self._video_legacy_requests.clear()
         self._video_translation_queue.clear()
         self._video_speakers.clear()
+        self._video_session_started_at = time.monotonic()
+        self._insight_seq += 1
+        self._insight_conversation.clear()
         self.video_source_edit.clear()
         self.video_result_edit.clear()
+        self.video_assistant_button.setEnabled(False)
+        if self._insight_dialog is not None:
+            self._insight_dialog.show_message(
+                "新的视频会话已经开始，识别出内容后可以生成新的总结。"
+            )
+            self._insight_dialog.set_session_info(0, 0)
+        self._sync_floating_launcher()
 
     def _audio_transcript_ready(
         self,
@@ -1280,6 +1780,8 @@ class MainWindow(QMainWindow):
         language_code: str,
         speaker: str,
         content_warning: str,
+        start_seconds: float,
+        end_seconds: float,
     ) -> None:
         if not self._video_monitoring:
             return
@@ -1299,6 +1801,8 @@ class MainWindow(QMainWindow):
             detected,
             queue_immediately=True,
             content_warning=content_warning,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
         )
 
     def _audio_status_changed(self, message: str) -> None:
@@ -1317,10 +1821,15 @@ class MainWindow(QMainWindow):
         self._set_video_status("error", "声音转写失败", message)
         self.toast.show_message(message, "error", 5200)
 
-    def _stop_video_monitoring(self, hide_overlay: bool = True) -> None:
+    def _stop_video_monitoring(
+        self,
+        hide_overlay: bool = True,
+        open_summary: bool = False,
+    ) -> None:
         if not self._video_monitoring:
             return
         self._video_monitoring = False
+        self._sync_floating_launcher()
         self.video_capture_timer.stop()
         self.video_debounce_timer.stop()
         worker = self._ocr_worker
@@ -1346,6 +1855,8 @@ class MainWindow(QMainWindow):
             else "字幕识别已停止"
         )
         self._set_video_status("ready", stopped)
+        if open_summary and self._video_entries:
+            QTimer.singleShot(180, self._open_video_insights)
 
     def _release_ocr_worker(self, worker: SubtitleOcrWorker) -> None:
         self._retired_ocr_workers.discard(worker)
@@ -1381,6 +1892,8 @@ class MainWindow(QMainWindow):
         language_code: str = "",
         queue_immediately: bool = False,
         content_warning: str = "",
+        start_seconds: float | None = None,
+        end_seconds: float | None = None,
     ) -> None:
         text = text.strip()
         if not text:
@@ -1402,6 +1915,17 @@ class MainWindow(QMainWindow):
         self._video_history = self._video_history[-12:]
         self._video_entry_seq += 1
         entry_id = self._video_entry_seq
+        if start_seconds is None:
+            start_seconds = max(
+                0.0,
+                time.monotonic() - self._video_session_started_at,
+            )
+        if end_seconds is None:
+            end_seconds = start_seconds
+        start_seconds = max(0.0, float(start_seconds))
+        end_seconds = max(start_seconds, float(end_seconds))
+        player_time = self._player_time_for_relative(end_seconds)
+        player_state = self._player_bridge.state
         entry: dict[str, Any] = {
             "id": entry_id,
             "speaker": speaker,
@@ -1412,6 +1936,14 @@ class MainWindow(QMainWindow):
             "language_code": language_code,
             "provider": "",
             "warning": content_warning.strip(),
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
+            "player_time_seconds": player_time,
+            "player_title": (
+                player_state.title
+                if player_time is not None and player_state is not None
+                else ""
+            ),
         }
         self._video_entries.append(entry)
         if speaker:
@@ -1420,12 +1952,14 @@ class MainWindow(QMainWindow):
         self._render_video_entries()
         self.video_source_badge.setText(source_label)
         self.video_translate_button.setEnabled(True)
+        self.video_assistant_button.setEnabled(True)
         self._set_video_status("busy", "检测到新内容，准备翻译…")
         self._update_video_overlay()
         if queue_immediately:
             self._queue_video_entry_translation(entry_id)
         else:
             self.video_debounce_timer.start()
+        self._sync_floating_launcher()
 
     def _find_video_entry(self, entry_id: int) -> dict[str, Any] | None:
         return next(
@@ -1440,7 +1974,17 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _video_speaker_prefix(entry: dict[str, Any]) -> str:
         speaker = str(entry.get("speaker", "")).strip()
-        return f"{speaker}：" if speaker else ""
+        timestamp = format_timestamp(
+            float(entry.get("start_seconds", 0.0) or 0.0)
+        )
+        player_time = entry.get("player_time_seconds")
+        if player_time is not None:
+            prefix = f"[视频 {format_timestamp(float(player_time))}]"
+        else:
+            prefix = f"[本次播放 {timestamp}]"
+        if speaker:
+            return f"{prefix} {speaker}："
+        return f"{prefix} "
 
     def _render_video_entries(self) -> None:
         source_lines: list[str] = []
@@ -1570,6 +2114,8 @@ class MainWindow(QMainWindow):
             and not self._video_pending_entries
             and not self._video_translation_queue
         )
+        self.video_assistant_button.setEnabled(bool(self._video_entries))
+        self._sync_floating_launcher()
 
     def _video_overlay_toggled(self, enabled: bool) -> None:
         self.settings["overlay_enabled"] = enabled
@@ -1581,6 +2127,175 @@ class MainWindow(QMainWindow):
             self._update_video_overlay()
         elif self._overlay is not None:
             self._overlay.hide()
+
+    def _video_insight_records(self) -> list[InsightRecord]:
+        return [
+            record_from_entry(entry)
+            for entry in self._video_entries
+            if str(entry.get("source", "")).strip()
+        ]
+
+    def _video_duration_seconds(self) -> float:
+        recorded_end = max(
+            (
+                float(entry.get("end_seconds", 0.0) or 0.0)
+                for entry in self._video_entries
+            ),
+            default=0.0,
+        )
+        if self._video_monitoring:
+            elapsed = time.monotonic() - self._video_session_started_at
+            return max(recorded_end, elapsed)
+        return recorded_end
+
+    def _open_video_insights(self, checked: bool = False) -> None:
+        del checked
+        if self._insight_dialog is None:
+            dialog = VideoAssistantDialog(self)
+            dialog.summarize_requested.connect(
+                lambda: self._start_video_insight("")
+            )
+            dialog.question_requested.connect(
+                lambda question: self._start_video_insight(question)
+            )
+            dialog.time_clicked.connect(self._focus_video_moment)
+            dialog.seek_requested.connect(self._seek_player_time)
+            self._insight_dialog = dialog
+        dialog = self._insight_dialog
+        records = self._video_insight_records()
+        player_state = self._player_bridge.state
+        dialog.set_session_info(
+            len(records),
+            self._video_duration_seconds(),
+            player_state.duration if player_state is not None else None,
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if not records:
+            dialog.show_message("先识别一段视频内容，再生成总结或继续提问。")
+            return
+        self._start_video_insight("")
+
+    def _start_video_insight(
+        self,
+        question: str,
+        focus_seconds: int = 0,
+    ) -> None:
+        dialog = self._insight_dialog
+        if dialog is None:
+            return
+        if self._insight_worker is not None and self._insight_worker.isRunning():
+            self.toast.show_message("上一项视频分析还没有完成。", "info", 2400)
+            return
+        records = self._video_insight_records()
+        if not records:
+            dialog.show_message("本次视频还没有可分析的对话内容。")
+            return
+        question = question.strip()
+        if question and (
+            "刚才" in question or "最近五分钟" in question
+        ):
+            focus_seconds = max(focus_seconds, 300)
+        if question:
+            dialog.add_question(question)
+            dialog.set_loading("正在结合对话记录回答…")
+        else:
+            dialog.set_loading("正在生成视频总结…")
+        self._insight_seq += 1
+        request_id = self._insight_seq
+        worker = VideoInsightWorker(
+            request_id,
+            self.settings,
+            records,
+            language_label(self._target_code()),
+            question,
+            focus_seconds,
+            self._insight_conversation if question else [],
+            self,
+        )
+        worker.result_ready.connect(self._insight_succeeded)
+        worker.error_ready.connect(self._insight_failed)
+        worker.finished.connect(lambda: self._finish_insight_worker(worker))
+        self._insight_worker = worker
+        dialog.set_session_info(
+            len(records),
+            self._video_duration_seconds(),
+            (
+                self._player_bridge.state.duration
+                if self._player_bridge.state is not None
+                else None
+            ),
+        )
+        worker.start()
+
+    def _insight_succeeded(
+        self,
+        request_id: int,
+        result: InsightResult,
+        question: str,
+    ) -> None:
+        if request_id != self._insight_seq or self._insight_dialog is None:
+            return
+        if question:
+            self._insight_dialog.add_answer(result.text, result.provider)
+            self._insight_conversation.extend(
+                [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": result.text},
+                ]
+            )
+            self._insight_conversation = self._insight_conversation[-12:]
+        else:
+            self._insight_dialog.set_summary(result.text, result.provider)
+            self._insight_conversation = []
+        self._set_video_status(
+            "success",
+            f"视频分析完成 · {result.provider}",
+        )
+
+    def _insight_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._insight_seq:
+            return
+        if self._insight_dialog is not None:
+            self._insight_dialog.set_error(message)
+        self.toast.show_message(message, "error", 5200)
+        if "API Key" in message and not self._settings_open:
+            QTimer.singleShot(300, self._open_settings)
+
+    def _finish_insight_worker(self, worker: VideoInsightWorker) -> None:
+        if self._insight_worker is worker:
+            self._insight_worker = None
+        worker.deleteLater()
+
+    def _focus_video_moment(self, seconds: float) -> None:
+        if not self._video_entries:
+            return
+        entry = min(
+            self._video_entries,
+            key=lambda item: abs(
+                float(item.get("start_seconds", 0.0) or 0.0) - seconds
+            ),
+        )
+        self._focus_video_entry(entry)
+        self.toast.show_message(
+            f"已定位到本次播放 {format_timestamp(seconds)}",
+            "info",
+            2200,
+        )
+
+    def _focus_video_entry(self, entry: dict[str, Any]) -> None:
+        if self._mode != 2:
+            self.mode_control.setCurrentIndex(2)
+            self._mode_changed(2)
+        source = str(entry.get("source", "")).strip()
+        cursor = self.video_source_edit.textCursor()
+        cursor.movePosition(QTextCursor.Start)
+        match = self.video_source_edit.document().find(source, cursor)
+        if not match.isNull():
+            self.video_source_edit.setTextCursor(match)
+            self.video_source_edit.ensureCursorVisible()
+        self.video_source_edit.setFocus()
 
     def _show_video_overlay(self) -> None:
         created = self._overlay is None
@@ -2174,6 +2889,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(self._recognition_finished)
         self._speech_worker = worker
         worker.start()
+        self._sync_floating_launcher()
 
     def _stop_listening(self) -> None:
         worker = self._speech_worker
@@ -2217,6 +2933,7 @@ class MainWindow(QMainWindow):
         self.voice_translate_button.setEnabled(
             bool(self.voice_source_edit.toPlainText().strip())
         )
+        self._sync_floating_launcher()
 
     def _escape(self) -> None:
         self.speaker.stop()
@@ -2261,7 +2978,64 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
 
+    def _remember_runtime_state(self) -> None:
+        self.settings["geometry"] = bytes(
+            self.saveGeometry().toBase64()
+        ).decode("ascii")
+        self.settings["source_lang"] = self._source_code()
+        self.settings["target_lang"] = self._target_code()
+        self.settings["auto_translate"] = self.auto_translate_check.isChecked()
+        self.settings["auto_speak"] = self.auto_speak_check.isChecked()
+        self.settings["floating_button_enabled"] = (
+            self.floating_check.isChecked()
+        )
+        if self._floating_launcher is not None:
+            self.settings["floating_button_pos"] = [
+                self._floating_launcher.x(),
+                self._floating_launcher.y(),
+            ]
+        if self._overlay is not None:
+            self.settings["overlay_pos"] = [
+                self._overlay.pos().x(),
+                self._overlay.pos().y(),
+            ]
+        if self._video_region is not None:
+            self.settings["video_region"] = [
+                self._video_region.x(),
+                self._video_region.y(),
+                self._video_region.width(),
+                self._video_region.height(),
+            ]
+        self._save_settings_quietly()
+
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        can_run_in_background = (
+            self._tray_icon is not None
+            or (
+                self._floating_launcher is not None
+                and self._floating_launcher.isVisible()
+            )
+        )
+        if not self._quitting and can_run_in_background:
+            self._remember_runtime_state()
+            if self._quick_action_panel is not None:
+                self._quick_action_panel.hide()
+            if self._insight_dialog is not None:
+                self._insight_dialog.hide()
+            if self._player_sync_dialog is not None:
+                self._player_sync_dialog.hide()
+            self.hide()
+            if self._tray_icon is not None and not self._background_hint_shown:
+                self._tray_icon.showMessage(
+                    "羽中纯声仍在后台运行",
+                    "识别和快捷键会继续工作。双击托盘图标或漂浮按钮可重新打开。",
+                    QSystemTrayIcon.Information,
+                    4200,
+                )
+                self._background_hint_shown = True
+            event.ignore()
+            return
+        self._remember_runtime_state()
         self.auto_timer.stop()
         self.speaker.stop()
         if self._hotkey_filter is not None:
@@ -2279,6 +3053,34 @@ class MainWindow(QMainWindow):
             self._quick_popup.close()
             self._quick_popup.deleteLater()
             self._quick_popup = None
+        if self._insight_dialog is not None:
+            self._insight_dialog.close()
+            self._insight_dialog.deleteLater()
+            self._insight_dialog = None
+        if self._player_sync_dialog is not None:
+            self._player_sync_dialog.close()
+            self._player_sync_dialog.deleteLater()
+            self._player_sync_dialog = None
+        self._player_bridge.stop()
+        self._insight_seq += 1
+        if self._insight_worker is not None:
+            if self._insight_worker.isRunning():
+                self._insight_worker.wait(1200)
+            if not self._insight_worker.isRunning():
+                self._insight_worker.deleteLater()
+            self._insight_worker = None
+        if self._quick_action_panel is not None:
+            self._quick_action_panel.hide()
+            self._quick_action_panel.deleteLater()
+            self._quick_action_panel = None
+        if self._floating_launcher is not None:
+            self.settings["floating_button_pos"] = [
+                self._floating_launcher.x(),
+                self._floating_launcher.y(),
+            ]
+            self._floating_launcher.hide()
+            self._floating_launcher.deleteLater()
+            self._floating_launcher = None
         if self._video_monitoring:
             self._stop_video_monitoring()
         if self._speech_worker is not None and self._speech_worker.isRunning():
@@ -2289,25 +3091,15 @@ class MainWindow(QMainWindow):
         for worker in list(self._retired_ocr_workers):
             worker.wait(3000)
         if self._overlay is not None:
-            self.settings["overlay_pos"] = [
-                self._overlay.pos().x(),
-                self._overlay.pos().y(),
-            ]
             self._overlay.close()
             self._overlay.deleteLater()
             self._overlay = None
-        if self._video_region is not None:
-            self.settings["video_region"] = [
-                self._video_region.x(),
-                self._video_region.y(),
-                self._video_region.width(),
-                self._video_region.height(),
-            ]
-        self.settings["geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
-        self.settings["source_lang"] = self._source_code()
-        self.settings["target_lang"] = self._target_code()
-        self.settings["auto_translate"] = self.auto_translate_check.isChecked()
-        self.settings["auto_speak"] = self.auto_speak_check.isChecked()
-        self._save_settings_quietly()
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+            self._tray_icon.deleteLater()
+            self._tray_icon = None
+        if self._tray_menu is not None:
+            self._tray_menu.deleteLater()
+            self._tray_menu = None
         event.accept()
 

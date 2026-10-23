@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "羽中纯声时间同步",
+  "version": "1.0.0",
+  "description": "把当前网页视频的播放时间同步给羽中纯声，并接收时间跳转命令。",
+  "permissions": [
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ]
+}

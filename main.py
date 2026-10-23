@@ -50,7 +50,7 @@ def run() -> int:
     app.setApplicationName("羽中纯声")
     app.setApplicationDisplayName("羽中纯声")
     app.setOrganizationName(APP_ID)
-    app.setQuitOnLastWindowClosed(True)
+    app.setQuitOnLastWindowClosed(False)
     app.setFont(QFont("Microsoft YaHei UI", 9))
     app.setStyleSheet(APP_QSS)
 

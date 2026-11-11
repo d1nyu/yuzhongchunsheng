@@ -1,21 +1,93 @@
 # 羽中纯声
 
-一个给自己用的 Windows 桌面翻译器，重点服务两个场景：
+> 把看不懂、听不清、记不住的内容，变成看得懂、跟得上、查得到的记录。
 
-- **看文本**：输入、粘贴，或者用全局快捷键框选屏幕上的任意文字，自动 OCR 并翻译。
-- **看视频**：有字幕时可以框选字幕区域做 OCR；没有字幕时可以采集电脑播放的声音，在本机转写后自动翻译，并在观看结束后总结、追问和定位原话。
+Windows 桌面翻译与视频理解工具。按 `Ctrl + Alt + T` 框选屏幕即可翻译；电脑播放的外语视频即使没有字幕，也能在本机完成转写、说话人分离与翻译，并在结束后生成可追问、可跳转的总结。
 
-红色羽毛与声波构成的品牌标识。默认翻译引擎已经配置为 DeepSeek，目标语言默认是简体中文。
+**识别在本机，翻译在云端，音频与截图不出电脑。**
 
-文字翻译支持 133 种目标语言，包含英语、日语、韩语、法语、德语、西班牙语、阿拉伯语、印地语、泰语、越南语、斯瓦希里语、泰米尔语等。常用语言置顶，其余语言可在下拉列表中滚动选择。
+[![tests](https://github.com/d1nyu/yuzhongchunsheng/actions/workflows/ci.yml/badge.svg)](https://github.com/d1nyu/yuzhongchunsheng/actions/workflows/ci.yml)
+![python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![platform](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?logo=windows&logoColor=white)
+![license](https://img.shields.io/badge/License-MIT-green)
 
 ![文字翻译](preview/text-translated.png)
 
+## 解决什么问题
+
+- **文字在图片里，复制不了。** PDF 扫描件、课程截图、软件界面、游戏对话——框选即译，不切走当前窗口。
+- **视频没有字幕，或字幕不能复制。** 采集电脑播放的声音，本地 Whisper 转写；有硬字幕的视频也可以直接识别画面。
+- **看完了，却记不住。** 停止识别后生成一句话结论、关键内容、分人观点、决定与待办，以及可点击回到原片的章节时间线。
+
+## 核心能力
+
+| 能力 | 说明 |
+| --- | --- |
+| 屏幕选区翻译 | 全局快捷键框选，本机 OCR，置顶结果卡片 |
+| 文字 / 语音翻译 | 130+ 目标语言，自动检测，朗读与复制 |
+| 电脑声音转写 | 系统声音回环 + VAD 断句 + 本地 Whisper + 说话人分离 |
+| 画面字幕识别 | 区域 OCR，字幕变化自动翻译，置顶悬浮字幕 |
+| 视频理解 | 分块抽取证据笔记再汇总；分人观点、时间线、连续追问 |
+| 播放器时间同步 | Chrome 扩展 + 本地桥接，总结中的时间引用可反控视频跳转 |
+
+## 架构
+
+```mermaid
+flowchart LR
+    A["屏幕选区 / 系统声音 / 画面字幕"] --> B["本机识别<br/>RapidOCR · Whisper · VAD · 说话人分离"]
+    B --> C["翻译引擎<br/>DeepSeek / Google / OpenAI 兼容"]
+    C --> D["呈现<br/>主窗口 · 悬浮字幕 · 结果卡片"]
+    B --> E["视频理解<br/>分块证据 → 汇总"]
+    C --> E
+    E --> F["多轮追问 · 时间引用跳转"]
+    G["Chrome 扩展"] -->|播放时间| H["本地桥接 127.0.0.1"]
+    H --> E
+    F -->|seek| G
+```
+
+几个关键取舍：
+
+- **识别放在本机**：音频与画面不出电脑，代价是模型体积和 CPU 占用；Whisper 不可用时回退 Vosk。
+- **长内容分块**：单次直传上限 28k 字符，超出按 11k 字符分块，先抽取带时间戳的证据笔记再汇总，兼顾上下文长度与 token 成本。
+- **失败可降级**：分人模型缺失时统一标记「说话人 1」；翻译引擎不可用时可以切换免费引擎，不阻断主流程。
+
+## 技术栈
+
+`Python` · `PyQt5` · `Whisper (pywhispercpp)` · `Vosk` · `RapidOCR` · `sherpa-onnx` · `webrtcvad` · `DeepSeek` · `Chrome Extension`
+
+## 隐私边界
+
+| 数据 | 处理位置 | 是否离开本机 |
+| --- | --- | --- |
+| 屏幕截图与 OCR | 本机 | 否 |
+| 麦克风 / 电脑声音识别 | 本机 | 否 |
+| 说话人分离与音乐过滤 | 本机 | 否 |
+| 待翻译文字、总结请求 | 所选翻译 / 大模型引擎 | 是 |
+| 播放状态 | 本机 127.0.0.1 桥接 | 否 |
+
+密钥使用 Windows DPAPI 加密，保存在 `%APPDATA%\YiSheng\settings.json`，与当前 Windows 用户绑定。
+
+## 快速开始
+
+```powershell
+python -m pip install -r requirements.txt
+python scripts/install_whisper_model.py
+pythonw main.py
+```
+
+首次使用建议先用一段文字测试翻译是否连通，再进入视频场景。完整步骤见下方「启动」。
+
+## 文档
+
+- [产品说明书（Word）](docs/羽中纯声产品说明书-V1.0.docx) ｜ [PDF](docs/羽中纯声产品说明书-V1.0.pdf)
+- [浏览器时间同步扩展](browser_extension/README.md)
+- 详细功能、快捷键与常见问题见下方完整说明
+
+---
+
 ## 启动
 
-双击工作目录里的 **`羽中纯声.lnk`**，或者双击 **`启动羽中纯声.cmd`**。
-
-也可以直接运行：
+双击 **`启动羽中纯声.cmd`**，或者直接运行：
 
 ```powershell
 pythonw main.py

@@ -10,6 +10,9 @@ models/
 Thumbs.db
 desktop.ini
 
+# Windows 快捷方式（含本机绝对路径，不入库）
+*.lnk
+
 # 日志
 *.log
 
